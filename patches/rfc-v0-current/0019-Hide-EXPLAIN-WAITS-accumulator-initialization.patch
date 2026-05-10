@@ -1,0 +1,101 @@
+From 96de0592d2ced8624d9fe722c6a0f87cda60774a Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 03:15:35 +0500
+Subject: [RFC PATCH v0 19/22] Hide EXPLAIN WAITS accumulator initialization
+
+---
+ src/backend/executor/execProcnode.c     | 11 ++---------
+ src/backend/utils/activity/wait_event.c | 23 ++++++++++++++++++++---
+ src/include/utils/wait_event.h          |  3 +--
+ 3 files changed, 23 insertions(+), 14 deletions(-)
+
+diff --git a/src/backend/executor/execProcnode.c b/src/backend/executor/execProcnode.c
+index 081855b3fed..deee14839f2 100644
+--- a/src/backend/executor/execProcnode.c
++++ b/src/backend/executor/execProcnode.c
+@@ -417,15 +417,8 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
+ 		result->instrument = InstrAllocNode(estate->es_instrument,
+ 											result->async_capable);
+ 	if (estate->es_instrument & INSTRUMENT_WAITS)
+-	{
+-		MemoryContext oldcontext;
+-
+-		oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+-		result->wait_event_usage = palloc_object(WaitEventUsage);
+-		pgstat_init_wait_event_usage(result->wait_event_usage,
+-									 estate->es_query_cxt);
+-		MemoryContextSwitchTo(oldcontext);
+-	}
++		result->wait_event_usage =
++			pgstat_create_wait_event_usage(estate->es_query_cxt);
+ 
+ 	return result;
+ }
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 4ff12c4e761..67980cc0a3b 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -42,6 +42,8 @@ static void WaitEventUsageAddOverflow(WaitEventUsage *usage, uint64 calls,
+ 									  const instr_time *elapsed);
+ static int	WaitEventUsageFind(const WaitEventUsage *usage,
+ 							   uint32 wait_event_info, bool *found);
++static void WaitEventUsageInit(WaitEventUsage *usage,
++							   MemoryContext memcontext);
+ 
+ 
+ static uint32 local_my_wait_event_info;
+@@ -380,11 +382,26 @@ pgstat_reset_wait_event_storage(void)
+ 	my_wait_event_info = &local_my_wait_event_info;
+ }
+ 
++/*
++ * Allocate and initialize a wait event usage accumulator.
++ */
++WaitEventUsage *
++pgstat_create_wait_event_usage(MemoryContext memcontext)
++{
++	WaitEventUsage *usage;
++
++	Assert(memcontext != NULL);
++
++	usage = MemoryContextAlloc(memcontext, sizeof(WaitEventUsage));
++	WaitEventUsageInit(usage, memcontext);
++	return usage;
++}
++
+ /*
+  * Initialize a wait event usage accumulator.
+  */
+-void
+-pgstat_init_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
++static void
++WaitEventUsageInit(WaitEventUsage *usage, MemoryContext memcontext)
+ {
+ 	Assert(usage != NULL);
+ 	Assert(memcontext != NULL);
+@@ -423,7 +440,7 @@ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
+ 
+-	pgstat_init_wait_event_usage(usage, memcontext);
++	WaitEventUsageInit(usage, memcontext);
+ 	usage->query_parent = pgstat_wait_event_usage;
+ 	/*
+ 	 * A nested EXPLAIN can error out while one of its plan nodes is active,
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 3e6288a580e..67497790307 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -40,8 +40,7 @@ static inline void pgstat_report_wait_start(uint32 wait_event_info);
+ static inline void pgstat_report_wait_end(void);
+ extern void pgstat_set_wait_event_storage(uint32 *wait_event_info);
+ extern void pgstat_reset_wait_event_storage(void);
+-extern void pgstat_init_wait_event_usage(WaitEventUsage *usage,
+-										 MemoryContext memcontext);
++extern WaitEventUsage *pgstat_create_wait_event_usage(MemoryContext memcontext);
+ extern void pgstat_begin_wait_event_usage(WaitEventUsage *usage,
+ 										  MemoryContext memcontext);
+ extern void pgstat_end_wait_event_usage(WaitEventUsage *usage);
+-- 
+2.52.0
+

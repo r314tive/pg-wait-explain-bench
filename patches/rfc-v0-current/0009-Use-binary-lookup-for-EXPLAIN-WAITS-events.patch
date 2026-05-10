@@ -1,0 +1,121 @@
+From db3cbce6b456be9bf3957eafaec7979df818feaa Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 01:24:02 +0500
+Subject: [RFC PATCH v0 09/22] Use binary lookup for EXPLAIN WAITS events
+
+---
+ doc/pg_wait_explain_diary.md            |  9 ++++
+ src/backend/utils/activity/wait_event.c | 56 ++++++++++++++++++++-----
+ 2 files changed, 54 insertions(+), 11 deletions(-)
+
+diff --git a/doc/pg_wait_explain_diary.md b/doc/pg_wait_explain_diary.md
+index 7e83f3b5c9c..366acfd3c00 100644
+--- a/doc/pg_wait_explain_diary.md
++++ b/doc/pg_wait_explain_diary.md
+@@ -64,3 +64,12 @@ measured interval's ownership explicit.  In normal PostgreSQL wait reporting
+ the start and end calls bracket a blocking operation without executor stack
+ movement, but using the start stack is the stricter model and avoids depending
+ on that practical property.
++
++### Accumulator lookup
++
++`WaitEventUsage` uses a sorted vector keyed by `wait_event_info`.  Completed
++waits use binary search to find the entry; only first observation of a distinct
++event requires insertion and possible array growth.  This avoids a linear scan
++on the hot wait-end path without introducing a hash table into code that can
++run inside critical sections.  The remaining insertion cost is proportional to
++the number of distinct wait events already seen by that query or plan node.
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 81350f0b7f1..e94d52fb94e 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -39,6 +39,8 @@ static const char *pgstat_get_wait_timeout(WaitEventTimeout w);
+ static const char *pgstat_get_wait_io(WaitEventIO w);
+ static void WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
+ 							  uint64 calls, const instr_time *elapsed);
++static int	WaitEventUsageFind(const WaitEventUsage *usage,
++							   uint32 wait_event_info, bool *found);
+ 
+ 
+ static uint32 local_my_wait_event_info;
+@@ -529,22 +531,47 @@ pgstat_accumulate_wait_event_usage(WaitEventUsage *usage,
+ 						  &entries[i].time);
+ }
+ 
++/*
++ * Find the existing entry, or the insertion position for a new entry.
++ *
++ * WaitEventUsage entries are kept sorted by wait_event_info so the hot
++ * wait-end path does not need a linear scan through all distinct wait events
++ * already seen by the query or plan node.
++ */
++static int
++WaitEventUsageFind(const WaitEventUsage *usage, uint32 wait_event_info,
++				   bool *found)
++{
++	int			low = 0;
++	int			high = usage->nentries;
++
++	while (low < high)
++	{
++		int			mid = low + (high - low) / 2;
++		uint32		entry_info = usage->entries[mid].wait_event_info;
++
++		if (entry_info < wait_event_info)
++			low = mid + 1;
++		else
++			high = mid;
++	}
++
++	*found = low < usage->nentries &&
++		usage->entries[low].wait_event_info == wait_event_info;
++	return low;
++}
++
+ static void
+ WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
+ 				  uint64 calls, const instr_time *elapsed)
+ {
+-	WaitEventUsageEntry *entry = NULL;
++	bool		found;
++	int			idx;
++	WaitEventUsageEntry *entry;
+ 
+-	for (int i = 0; i < usage->nentries; i++)
+-	{
+-		if (usage->entries[i].wait_event_info == wait_event_info)
+-		{
+-			entry = &usage->entries[i];
+-			break;
+-		}
+-	}
++	idx = WaitEventUsageFind(usage, wait_event_info, &found);
+ 
+-	if (entry == NULL)
++	if (!found)
+ 	{
+ 		if (usage->nentries >= usage->maxentries)
+ 		{
+@@ -569,11 +596,18 @@ WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
+ 			usage->maxentries = newmaxentries;
+ 		}
+ 
+-		entry = &usage->entries[usage->nentries++];
++		if (idx < usage->nentries)
++			memmove(&usage->entries[idx + 1], &usage->entries[idx],
++					sizeof(WaitEventUsageEntry) * (usage->nentries - idx));
++
++		entry = &usage->entries[idx];
++		usage->nentries++;
+ 		entry->wait_event_info = wait_event_info;
+ 		entry->calls = 0;
+ 		INSTR_TIME_SET_ZERO(entry->time);
+ 	}
++	else
++		entry = &usage->entries[idx];
+ 
+ 	entry->calls += calls;
+ 	INSTR_TIME_ADD(entry->time, *elapsed);
+-- 
+2.52.0
+

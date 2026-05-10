@@ -1,0 +1,123 @@
+Pager usage is off.
+Timing is on.
+CREATE FUNCTION
+Time: 399.639 ms
+ bench_wait_loop 
+-----------------
+         1000000
+(1 row)
+
+Time: 1.656 ms
+BENCH c_wait_loop_disabled_50m
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 43.633 ms
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 32.915 ms
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 30.848 ms
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 26.255 ms
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 28.643 ms
+BENCH c_wait_loop_explain_no_waits_50m
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 29.865 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 28.811 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 28.659 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 35.378 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 31.745 ms
+BENCH c_wait_loop_explain_waits_10m
+                     QUERY PLAN                     
+----------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=10000000 time=142.987 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=10000000 time=142.987 ms
+(5 rows)
+
+Time: 324.272 ms
+                     QUERY PLAN                     
+----------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=10000000 time=141.010 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=10000000 time=141.010 ms
+(5 rows)
+
+Time: 319.436 ms
+                     QUERY PLAN                     
+----------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=10000000 time=139.895 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=10000000 time=139.895 ms
+(5 rows)
+
+Time: 316.999 ms
+                     QUERY PLAN                     
+----------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=10000000 time=141.319 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=10000000 time=141.319 ms
+(5 rows)
+
+Time: 321.165 ms
+                     QUERY PLAN                     
+----------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=10000000 time=146.720 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=10000000 time=146.720 ms
+(5 rows)
+
+Time: 331.806 ms

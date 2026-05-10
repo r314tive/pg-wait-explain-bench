@@ -1,0 +1,549 @@
+From 6fc0404acb69765067ccbf1ca3ee0fd39240f9d6 Mon Sep 17 00:00:00 2001
+Message-ID: <6fc0404acb69765067ccbf1ca3ee0fd39240f9d6.1778280923.git.tanswis42@gmail.com>
+In-Reply-To: <cover.1778280923.git.tanswis42@gmail.com>
+References: <cover.1778280923.git.tanswis42@gmail.com>
+From: Ilmar Yunusov <tanswis42@gmail.com>
+Date: Sat, 9 May 2026 03:44:10 +0500
+Subject: [RFC PATCH v0 1/7] Add EXPLAIN WAITS statement reporting
+
+---
+ doc/src/sgml/ref/explain.sgml           |  14 +++
+ src/backend/commands/explain.c          | 129 +++++++++++++++++++-
+ src/backend/commands/explain_state.c    |   8 ++
+ src/backend/utils/activity/wait_event.c | 149 ++++++++++++++++++++++++
+ src/include/commands/explain_state.h    |   1 +
+ src/include/utils/wait_event.h          |  29 +++++
+ src/test/regress/expected/explain.out   |  17 +++
+ src/test/regress/sql/explain.sql        |   5 +
+ 8 files changed, 349 insertions(+), 3 deletions(-)
+
+diff --git a/doc/src/sgml/ref/explain.sgml b/doc/src/sgml/ref/explain.sgml
+index e95e19081e1..5460568af1d 100644
+--- a/doc/src/sgml/ref/explain.sgml
++++ b/doc/src/sgml/ref/explain.sgml
+@@ -47,6 +47,7 @@ EXPLAIN [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] <rep
+     SUMMARY [ <replaceable class="parameter">boolean</replaceable> ]
+     MEMORY [ <replaceable class="parameter">boolean</replaceable> ]
+     IO [ <replaceable class="parameter">boolean</replaceable> ]
++    WAITS [ <replaceable class="parameter">boolean</replaceable> ]
+     FORMAT { TEXT | XML | JSON | YAML }
+ </synopsis>
+  </refsynopsisdiv>
+@@ -310,6 +311,19 @@ ROLLBACK;
+     </listitem>
+    </varlistentry>
+ 
++   <varlistentry>
++    <term><literal>WAITS</literal></term>
++    <listitem>
++     <para>
++      Include exact backend-local wait event timing observed during query
++      execution.  Wait events are grouped by wait event type and wait event
++      name, and include the number of waits and total time spent waiting.
++      This parameter may only be used when <literal>ANALYZE</literal> is also
++      enabled.  It defaults to <literal>FALSE</literal>.
++     </para>
++    </listitem>
++   </varlistentry>
++
+    <varlistentry>
+     <term><literal>FORMAT</literal></term>
+     <listitem>
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 112c17b0d64..0b7cc5c15c6 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -45,6 +45,7 @@
+ #include "utils/tuplesort.h"
+ #include "utils/tuplestore.h"
+ #include "utils/typcache.h"
++#include "utils/wait_event.h"
+ #include "utils/xml.h"
+ 
+ 
+@@ -149,6 +150,9 @@ static const char *explain_get_index_name(Oid indexId);
+ static bool peek_buffer_usage(ExplainState *es, const BufferUsage *usage);
+ static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
+ static void show_wal_usage(ExplainState *es, const WalUsage *usage);
++static int	wait_event_usage_cmp(const void *a, const void *b);
++static void show_wait_event_usage(ExplainState *es,
++								  const WaitEventUsage *usage);
+ static void show_memory_counters(ExplainState *es,
+ 								 const MemoryContextCounters *mem_counters);
+ static void show_result_replacement_info(Result *result, ExplainState *es);
+@@ -510,6 +514,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ 	int			eflags;
+ 	int			instrument_option = 0;
+ 	SerializeMetrics serializeMetrics = {0};
++	WaitEventUsage waitEventUsage;
++	WaitEventUsage *waitEventUsagePtr = NULL;
+ 
+ 	Assert(plannedstmt->commandType != CMD_UTILITY);
+ 
+@@ -583,11 +589,27 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ 		else
+ 			dir = ForwardScanDirection;
+ 
++		if (es->waits)
++		{
++			waitEventUsagePtr = &waitEventUsage;
++			pgstat_begin_wait_event_usage(waitEventUsagePtr,
++										  queryDesc->estate->es_query_cxt);
++		}
++
+ 		/* run the plan */
+-		ExecutorRun(queryDesc, dir, 0);
++		PG_TRY();
++		{
++			ExecutorRun(queryDesc, dir, 0);
+ 
+-		/* run cleanup too */
+-		ExecutorFinish(queryDesc);
++			/* run cleanup too */
++			ExecutorFinish(queryDesc);
++		}
++		PG_FINALLY();
++		{
++			if (waitEventUsagePtr)
++				pgstat_end_wait_event_usage(waitEventUsagePtr);
++		}
++		PG_END_TRY();
+ 
+ 		/* We can't run ExecutorEnd 'till we're done printing the stats... */
+ 		totaltime += elapsed_time(&starttime);
+@@ -605,6 +627,9 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ 	/* Create textual dump of plan tree */
+ 	ExplainPrintPlan(es, queryDesc);
+ 
++	if (waitEventUsagePtr)
++		show_wait_event_usage(es, waitEventUsagePtr);
++
+ 	/* Show buffer and/or memory usage in planning */
+ 	if (peek_buffer_usage(es, bufusage) || mem_counters)
+ 	{
+@@ -4503,6 +4528,104 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
+ 	}
+ }
+ 
++static int
++wait_event_usage_cmp(const void *a, const void *b)
++{
++	const WaitEventUsageEntry *ea = (const WaitEventUsageEntry *) a;
++	const WaitEventUsageEntry *eb = (const WaitEventUsageEntry *) b;
++	int64		ta = INSTR_TIME_GET_MICROSEC(ea->time);
++	int64		tb = INSTR_TIME_GET_MICROSEC(eb->time);
++
++	if (ta < tb)
++		return 1;
++	if (ta > tb)
++		return -1;
++	if (ea->wait_event_info < eb->wait_event_info)
++		return -1;
++	if (ea->wait_event_info > eb->wait_event_info)
++		return 1;
++	return 0;
++}
++
++static void
++show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
++{
++	WaitEventUsageEntry *entries;
++
++	if (usage == NULL)
++		return;
++
++	if (es->format == EXPLAIN_FORMAT_TEXT && usage->nentries == 0)
++		return;
++
++	if (usage->nentries > 0)
++	{
++		entries = palloc_array(WaitEventUsageEntry, usage->nentries);
++		memcpy(entries, usage->entries,
++			   sizeof(WaitEventUsageEntry) * usage->nentries);
++		qsort(entries, usage->nentries, sizeof(WaitEventUsageEntry),
++			  wait_event_usage_cmp);
++	}
++	else
++		entries = NULL;
++
++	if (es->format == EXPLAIN_FORMAT_TEXT)
++	{
++		ExplainIndentText(es);
++		appendStringInfoString(es->str, "Wait Events:\n");
++		es->indent++;
++
++		for (int i = 0; i < usage->nentries; i++)
++		{
++			const char *event_type;
++			const char *event_name;
++
++			event_type = pgstat_get_wait_event_type(entries[i].wait_event_info);
++			event_name = pgstat_get_wait_event(entries[i].wait_event_info);
++
++			ExplainIndentText(es);
++			appendStringInfo(es->str, "%s:%s calls=%" PRIu64 " time=%0.3f ms\n",
++							 event_type ? event_type : "Unknown",
++							 event_name ? event_name : "unknown",
++							 entries[i].calls,
++							 INSTR_TIME_GET_MILLISEC(entries[i].time));
++		}
++
++		es->indent--;
++	}
++	else
++	{
++		ExplainOpenGroup("Wait-Events", "Wait Events", false, es);
++
++		for (int i = 0; i < usage->nentries; i++)
++		{
++			const char *event_type;
++			const char *event_name;
++
++			event_type = pgstat_get_wait_event_type(entries[i].wait_event_info);
++			event_name = pgstat_get_wait_event(entries[i].wait_event_info);
++
++			ExplainOpenGroup("Wait-Event", NULL, true, es);
++			ExplainPropertyText("Wait Event Type",
++								event_type ? event_type : "Unknown",
++								es);
++			ExplainPropertyText("Wait Event",
++								event_name ? event_name : "unknown",
++								es);
++			ExplainPropertyUInteger("Calls", NULL, entries[i].calls, es);
++			ExplainPropertyFloat("Time", "ms",
++								 INSTR_TIME_GET_MILLISEC(entries[i].time),
++								 3, es);
++			ExplainCloseGroup("Wait-Event", NULL, true, es);
++		}
++
++		ExplainCloseGroup("Wait-Events", "Wait Events", false, es);
++	}
++
++	if (entries)
++		pfree(entries);
++}
++
+ /*
+  * Show memory usage details.
+  */
+diff --git a/src/backend/commands/explain_state.c b/src/backend/commands/explain_state.c
+index a0ee0a664be..2abcb64cc95 100644
+--- a/src/backend/commands/explain_state.c
++++ b/src/backend/commands/explain_state.c
+@@ -164,6 +164,8 @@ ParseExplainOptionList(ExplainState *es, List *options, ParseState *pstate)
+ 		}
+ 		else if (strcmp(opt->defname, "io") == 0)
+ 			es->io = defGetBoolean(opt);
++		else if (strcmp(opt->defname, "waits") == 0)
++			es->waits = defGetBoolean(opt);
+ 		else if (!ApplyExtensionExplainOption(es, opt, pstate))
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_SYNTAX_ERROR),
+@@ -196,6 +198,12 @@ ParseExplainOptionList(ExplainState *es, List *options, ParseState *pstate)
+ 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 				 errmsg("EXPLAIN option %s requires ANALYZE", "IO")));
+ 
++	/* check that WAITS is used with EXPLAIN ANALYZE */
++	if (es->waits && !es->analyze)
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("EXPLAIN option %s requires ANALYZE", "WAITS")));
++
+ 	/* check that serialize is used with EXPLAIN ANALYZE */
+ 	if (es->serialize != EXPLAIN_SERIALIZE_NONE && !es->analyze)
+ 		ereport(ERROR,
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 95635c7f56c..60d37ccbb73 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -36,11 +36,20 @@ static const char *pgstat_get_wait_client(WaitEventClient w);
+ static const char *pgstat_get_wait_ipc(WaitEventIPC w);
+ static const char *pgstat_get_wait_timeout(WaitEventTimeout w);
+ static const char *pgstat_get_wait_io(WaitEventIO w);
++static void WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
++							  const instr_time *elapsed);
+ 
+ 
+ static uint32 local_my_wait_event_info;
+ uint32	   *my_wait_event_info = &local_my_wait_event_info;
+ 
++#define WAIT_EVENT_USAGE_INITIAL_EVENTS	16
++
++int			pgstat_wait_event_usage_depth = 0;
++static WaitEventUsage *pgstat_wait_event_usage = NULL;
++static uint32 pgstat_wait_event_usage_current = 0;
++static instr_time pgstat_wait_event_usage_start;
++
+ #define WAIT_EVENT_CLASS_MASK	0xFF000000
+ #define WAIT_EVENT_ID_MASK		0x0000FFFF
+ 
+@@ -349,6 +358,146 @@ pgstat_reset_wait_event_storage(void)
+ 	my_wait_event_info = &local_my_wait_event_info;
+ }
+ 
++/*
++ * Start collecting exact wait event timings in this backend.
++ *
++ * This is intended for short-lived instrumentation such as EXPLAIN ANALYZE.
++ * It records waits observed through pgstat_report_wait_start/end in backend
++ * local memory.  Nested collection is deliberately treated as part of the
++ * outer collection for now; callers that want independent nested accounting
++ * need a stack of WaitEventUsage contexts.
++ */
++void
++pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
++{
++	Assert(usage != NULL);
++	Assert(memcontext != NULL);
++
++	if (pgstat_wait_event_usage_depth++ == 0)
++	{
++		memset(usage, 0, sizeof(WaitEventUsage));
++		usage->memcontext = memcontext;
++		pgstat_wait_event_usage = usage;
++		pgstat_wait_event_usage_current = 0;
++		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
++	}
++}
++
++/*
++ * Stop collecting wait event timings.
++ */
++void
++pgstat_end_wait_event_usage(WaitEventUsage *usage)
++{
++	Assert(usage != NULL);
++	Assert(pgstat_wait_event_usage_depth > 0);
++
++	if (--pgstat_wait_event_usage_depth == 0)
++	{
++		if (pgstat_wait_event_usage_current != 0)
++			pgstat_count_wait_event_end();
++
++		pgstat_wait_event_usage = NULL;
++		pgstat_wait_event_usage_current = 0;
++		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
++	}
++}
++
++/*
++ * Record the beginning of a wait event for exact EXPLAIN-style accounting.
++ */
++void
++pgstat_count_wait_event_start(uint32 wait_event_info)
++{
++	if (pgstat_wait_event_usage == NULL)
++		return;
++
++	/*
++	 * Waits are not expected to nest.  If they do, finish the previous wait
++	 * at the boundary so accounting remains internally consistent.
++	 */
++	if (pgstat_wait_event_usage_current != 0)
++		pgstat_count_wait_event_end();
++
++	pgstat_wait_event_usage_current = wait_event_info;
++	INSTR_TIME_SET_CURRENT(pgstat_wait_event_usage_start);
++}
++
++/*
++ * Record the end of the current wait event.
++ */
++void
++pgstat_count_wait_event_end(void)
++{
++	instr_time	end;
++	instr_time	elapsed;
++
++	if (pgstat_wait_event_usage == NULL ||
++		pgstat_wait_event_usage_current == 0)
++		return;
++
++	INSTR_TIME_SET_CURRENT(end);
++	elapsed = end;
++	INSTR_TIME_SUBTRACT(elapsed, pgstat_wait_event_usage_start);
++
++	WaitEventUsageAdd(pgstat_wait_event_usage,
++					  pgstat_wait_event_usage_current,
++					  &elapsed);
++
++	pgstat_wait_event_usage_current = 0;
++	INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
++}
++
++static void
++WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
++				  const instr_time *elapsed)
++{
++	WaitEventUsageEntry *entry = NULL;
++
++	for (int i = 0; i < usage->nentries; i++)
++	{
++		if (usage->entries[i].wait_event_info == wait_event_info)
++		{
++			entry = &usage->entries[i];
++			break;
++		}
++	}
++
++	if (entry == NULL)
++	{
++		if (usage->nentries >= usage->maxentries)
++		{
++			MemoryContext oldcontext;
++			int			newmaxentries;
++
++			if (usage->maxentries > 0)
++				newmaxentries = usage->maxentries * 2;
++			else
++				newmaxentries = WAIT_EVENT_USAGE_INITIAL_EVENTS;
++
++			oldcontext = MemoryContextSwitchTo(usage->memcontext);
++			if (usage->entries)
++				usage->entries = repalloc_array(usage->entries,
++												WaitEventUsageEntry,
++												newmaxentries);
++			else
++				usage->entries = palloc_array(WaitEventUsageEntry,
++											  newmaxentries);
++			MemoryContextSwitchTo(oldcontext);
++
++			usage->maxentries = newmaxentries;
++		}
++
++		entry = &usage->entries[usage->nentries++];
++		entry->wait_event_info = wait_event_info;
++		entry->calls = 0;
++		INSTR_TIME_SET_ZERO(entry->time);
++	}
++
++	entry->calls++;
++	INSTR_TIME_ADD(entry->time, *elapsed);
++}
++
+ /* ----------
+  * pgstat_get_wait_event_type() -
+  *
+diff --git a/src/include/commands/explain_state.h b/src/include/commands/explain_state.h
+index 97bc7ed49f6..4f0d0d495d4 100644
+--- a/src/include/commands/explain_state.h
++++ b/src/include/commands/explain_state.h
+@@ -56,6 +56,7 @@ typedef struct ExplainState
+ 	bool		memory;			/* print planner's memory usage information */
+ 	bool		settings;		/* print modified settings */
+ 	bool		io;				/* print info about IO (prefetch, ...) */
++	bool		waits;			/* print wait event usage */
+ 	bool		generic;		/* generate a generic plan */
+ 	ExplainSerializeOption serialize;	/* serialize the query's output? */
+ 	ExplainFormat format;		/* output format */
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 86ee348220d..f7fab5736bb 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -11,16 +11,39 @@
+ #define WAIT_EVENT_H
+ 
+ /* enums for wait events */
++#include "portability/instr_time.h"
++#include "utils/palloc.h"
+ #include "utils/wait_event_types.h"
+ 
++typedef struct WaitEventUsageEntry
++{
++	uint32		wait_event_info;
++	uint64		calls;
++	instr_time	time;
++} WaitEventUsageEntry;
++
++typedef struct WaitEventUsage
++{
++	MemoryContext memcontext;
++	int			nentries;
++	int			maxentries;
++	WaitEventUsageEntry *entries;
++} WaitEventUsage;
++
+ extern const char *pgstat_get_wait_event(uint32 wait_event_info);
+ extern const char *pgstat_get_wait_event_type(uint32 wait_event_info);
+ static inline void pgstat_report_wait_start(uint32 wait_event_info);
+ static inline void pgstat_report_wait_end(void);
+ extern void pgstat_set_wait_event_storage(uint32 *wait_event_info);
+ extern void pgstat_reset_wait_event_storage(void);
++extern void pgstat_begin_wait_event_usage(WaitEventUsage *usage,
++										  MemoryContext memcontext);
++extern void pgstat_end_wait_event_usage(WaitEventUsage *usage);
++extern void pgstat_count_wait_event_start(uint32 wait_event_info);
++extern void pgstat_count_wait_event_end(void);
+ 
+ extern PGDLLIMPORT uint32 *my_wait_event_info;
++extern PGDLLIMPORT int pgstat_wait_event_usage_depth;
+ 
+ 
+ /*
+@@ -66,6 +89,9 @@ extern char **GetWaitEventCustomNames(uint32 classId, int *nwaitevents);
+ static inline void
+ pgstat_report_wait_start(uint32 wait_event_info)
+ {
++	if (pgstat_wait_event_usage_depth > 0)
++		pgstat_count_wait_event_start(wait_event_info);
++
+ 	/*
+ 	 * Since this is a four-byte field which is always read and written as
+ 	 * four-bytes, updates are atomic.
+@@ -82,6 +108,9 @@ pgstat_report_wait_start(uint32 wait_event_info)
+ static inline void
+ pgstat_report_wait_end(void)
+ {
++	if (pgstat_wait_event_usage_depth > 0)
++		pgstat_count_wait_event_end();
++
+ 	/* see pgstat_report_wait_start() */
+ 	*(volatile uint32 *) my_wait_event_info = 0;
+ }
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index 74a4d87801e..2c7a7e1d4c6 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -99,6 +99,23 @@ select explain_filter('explain (buffers, format text) select * from int8_tbl i8'
+  Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+ (1 row)
+ 
++-- WAITS option
++select explain_filter('explain (analyze, waits, costs off, summary off, timing off, buffers off) select pg_sleep(0.01)');
++            explain_filter             
++---------------------------------------
++ Result (actual rows=N.N loops=N)
++ Wait Events:
++   Timeout:PgSleep calls=N time=N.N ms
++(3 rows)
++
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Wait Events,0}';
++                                     ?column?                                     
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
++explain (waits) select 1;
++ERROR:  EXPLAIN option WAITS requires ANALYZE
+ \a
+ select explain_filter('explain (analyze, buffers, io, format xml) select * from int8_tbl i8');
+ explain_filter
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index 2f163c64bf6..fe025ddeac5 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -68,6 +68,11 @@ select explain_filter('explain (analyze, buffers off, verbose) select * from int
+ select explain_filter('explain (analyze, buffers, format text) select * from int8_tbl i8');
+ select explain_filter('explain (buffers, format text) select * from int8_tbl i8');
+ 
++-- WAITS option
++select explain_filter('explain (analyze, waits, costs off, summary off, timing off, buffers off) select pg_sleep(0.01)');
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Wait Events,0}';
++explain (waits) select 1;
++
+ \a
+ select explain_filter('explain (analyze, buffers, io, format xml) select * from int8_tbl i8');
+ select explain_filter('explain (analyze, serialize, buffers, io, format yaml) select * from int8_tbl i8');
+-- 
+2.52.0
+

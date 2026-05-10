@@ -1,0 +1,109 @@
+From 40d44bdbb321f83f2b00c398d1dbd5fad64ab2a9 Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 01:20:51 +0500
+Subject: [RFC PATCH v0 08/22] Use wait-start stack for EXPLAIN WAITS
+ attribution
+
+---
+ doc/pg_wait_explain_diary.md            | 11 +++++++++++
+ src/backend/utils/activity/wait_event.c |  9 ++++++---
+ src/include/utils/wait_event.h          |  2 +-
+ 3 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/doc/pg_wait_explain_diary.md b/doc/pg_wait_explain_diary.md
+index 4dca78f8c64..7e83f3b5c9c 100644
+--- a/doc/pg_wait_explain_diary.md
++++ b/doc/pg_wait_explain_diary.md
+@@ -53,3 +53,14 @@ Nested top-level wait collection is still treated as part of the outer
+ collection.  The stack introduced here is the active plan-node stack for
+ per-node attribution, not an independent stack of query-level collection
+ contexts.
++
++## 2026-05-09
++
++### Attribution point
++
++Per-node wait attribution uses the active plan-node stack captured at wait
++start, not whatever stack happens to be active at wait end.  This makes the
++measured interval's ownership explicit.  In normal PostgreSQL wait reporting
++the start and end calls bracket a blocking operation without executor stack
++movement, but using the start stack is the stricter model and avoids depending
++on that practical property.
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 9615e6a9f5c..81350f0b7f1 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -56,6 +56,7 @@ static WaitEventUsage *pgstat_wait_event_usage = NULL;
+  * of EXPLAIN ANALYZE plan nodes.
+  */
+ static WaitEventUsage *pgstat_wait_event_node_usage = NULL;
++static WaitEventUsage *pgstat_wait_event_usage_node_stack = NULL;
+ static uint32 pgstat_wait_event_usage_current = 0;
+ static instr_time pgstat_wait_event_usage_start;
+ 
+@@ -409,6 +410,7 @@ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 		pgstat_init_wait_event_usage(usage, memcontext);
+ 		pgstat_wait_event_usage = usage;
+ 		pgstat_wait_event_node_usage = NULL;
++		pgstat_wait_event_usage_node_stack = NULL;
+ 		pgstat_wait_event_usage_current = 0;
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
+@@ -430,6 +432,7 @@ pgstat_end_wait_event_usage(WaitEventUsage *usage)
+ 
+ 		pgstat_wait_event_usage = NULL;
+ 		pgstat_wait_event_node_usage = NULL;
++		pgstat_wait_event_usage_node_stack = NULL;
+ 		pgstat_wait_event_usage_current = 0;
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
+@@ -453,8 +456,6 @@ pgstat_restore_wait_event_usage(WaitEventUsage *usage)
+ 	Assert(pgstat_wait_event_node_usage == NULL ||
+ 		   pgstat_wait_event_node_usage->active_parent == usage);
+ 
+-	if (pgstat_wait_event_node_usage != NULL)
+-		pgstat_wait_event_node_usage->active_parent = NULL;
+ 	pgstat_wait_event_node_usage = usage;
+ }
+ 
+@@ -475,6 +476,7 @@ pgstat_count_wait_event_start(uint32 wait_event_info)
+ 		pgstat_count_wait_event_end();
+ 
+ 	pgstat_wait_event_usage_current = wait_event_info;
++	pgstat_wait_event_usage_node_stack = pgstat_wait_event_node_usage;
+ 	INSTR_TIME_SET_CURRENT(pgstat_wait_event_usage_start);
+ }
+ 
+@@ -499,7 +501,7 @@ pgstat_count_wait_event_end(void)
+ 					  pgstat_wait_event_usage_current,
+ 					  1,
+ 					  &elapsed);
+-	for (WaitEventUsage *node_usage = pgstat_wait_event_node_usage;
++	for (WaitEventUsage *node_usage = pgstat_wait_event_usage_node_stack;
+ 		 node_usage != NULL;
+ 		 node_usage = node_usage->active_parent)
+ 		WaitEventUsageAdd(node_usage,
+@@ -508,6 +510,7 @@ pgstat_count_wait_event_end(void)
+ 						  &elapsed);
+ 
+ 	pgstat_wait_event_usage_current = 0;
++	pgstat_wait_event_usage_node_stack = NULL;
+ 	INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ }
+ 
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index e3eb76c98eb..a91f4de0ecb 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -25,7 +25,7 @@ typedef struct WaitEventUsageEntry
+ typedef struct WaitEventUsage
+ {
+ 	MemoryContext memcontext;
+-	struct WaitEventUsage *active_parent;
++	struct WaitEventUsage *active_parent; /* active plan-node stack link */
+ 	int			nentries;
+ 	int			maxentries;
+ 	WaitEventUsageEntry *entries;
+-- 
+2.52.0
+

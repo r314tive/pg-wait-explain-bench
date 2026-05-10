@@ -1,0 +1,114 @@
+From 7fb9ef35e18a863870ac5c10c346dd739fe7050b Mon Sep 17 00:00:00 2001
+Message-ID: <cover.1778280923.git.tanswis42@gmail.com>
+From: Ilmar Yunusov <tanswis42@gmail.com>
+Date: Sat, 9 May 2026 03:55:23 +0500
+Subject: [RFC PATCH v0 0/7] Add EXPLAIN ANALYZE wait event reporting
+
+This RFC prototype adds `EXPLAIN (ANALYZE, WAITS)`, which reports
+completed wait intervals observed through `pgstat_report_wait_start/end()`.
+The option is named `WAITS` in this RFC to match the short style of
+`BUFFERS`, `WAL`, `IO`, and `MEMORY`.  I am not attached to the exact name;
+`WAIT_EVENTS` may be clearer but is more verbose.
+
+PostgreSQL already exposes a backend's current wait event through
+pg_stat_activity.  This patch explores making the same wait event
+instrumentation useful in EXPLAIN ANALYZE by collecting per-statement and
+per-plan-node wait event usage while a statement executes.
+
+Statement-level output is reported as `Statement Wait Events`.  It counts
+each completed wait once per active statement-level collector and includes
+parallel worker waits.  Nested EXPLAIN ANALYZE WAITS collectors maintain
+separate statement-level summaries; a wait is counted once in each active
+collector.
+
+Plan-node output is reported as `Wait Events`.  Node-level attribution is
+intentionally inclusive, matching EXPLAIN ANALYZE node timing: a wait is
+attributed to every active plan node captured when the wait begins.  This
+means parent and child nodes can show the same wait, and node-level wait
+times must not be summed to compute a statement total.
+
+The implementation keeps wait-end accounting allocation-free.  Each
+statement and plan-node accumulator preallocates storage for 64 distinct
+wait event identities; additional distinct identities are accumulated in
+`Unrecorded Wait Event Calls` and `Unrecorded Wait Event Time` without event
+identity.  The fixed bound is intended to make the wait-end path predictable
+and safe in places where allocation would be undesirable.  The overflow
+bucket preserves total calls/time, but loses per-event identity.  This is a
+deliberate RFC point.
+
+Patch layout:
+
+1. add statement-level EXPLAIN WAITS reporting;
+2. aggregate statement-level waits from parallel workers;
+3. add plan-node wait attribution, including manual executor paths;
+4. refine attribution semantics, docs, overflow output, and tests;
+5. harden accumulator handling and keep wait-end allocation-free;
+6. hide accumulator internals behind the wait-event accounting API;
+7. update EXPLAIN option tab completion.
+
+Important review questions:
+
+- Is the `WAITS` option name and output shape acceptable, or should this be
+  `WAIT_EVENTS` / different labels?
+- Is inclusive per-node attribution the right semantic for EXPLAIN?
+- Is the fixed 64-entry accumulator plus explicit overflow bucket acceptable?
+- Is the disabled hot-path overhead of checking an exported boolean in
+  pgstat_report_wait_start/end acceptable?
+- Are the test scaffolding choices acceptable, especially planner GUCs and
+  pg_sleep wrappers used to force deterministic wait-attribution cases?  The
+  tests use pg_sleep only to force a stable Timeout:PgSleep wait identity;
+  durations are normalized by the existing EXPLAIN test filters.
+
+Local verification so far:
+
+- `make -s -j4`
+- `make -C doc/src/sgml check`
+- `make -s -C src/bin/psql`
+- `make -C src/test/regress check-tests TESTS='test_setup create_index explain'`
+- `git diff --check`
+
+The final diff of this 7-patch branch is identical to the development branch
+`r314tive/pg-wait-explain-mvp`.
+
+Local optimized macOS microbenchmarks are directional only.  The current
+synthetic C wait-loop run measured roughly 0.1-0.2 ns/wait disabled overhead
+and about 30 ns/wait enabled accounting for a single active node.  These
+numbers are not intended as performance evidence for commit; they only served
+as a local smoke check that the disabled path is plausibly small.  I would
+want repeated Linux, CPU-pinned numbers before drawing stronger conclusions.
+
+Ilmar Yunusov (7):
+  Add EXPLAIN WAITS statement reporting
+  Aggregate EXPLAIN WAITS from parallel workers
+  Attribute EXPLAIN WAITS to plan nodes
+  Refine EXPLAIN WAITS attribution semantics
+  Harden EXPLAIN WAITS accumulator handling
+  Hide EXPLAIN WAITS accumulator internals
+  Keep EXPLAIN option completion current
+
+ doc/src/sgml/ref/explain.sgml              |  61 ++++
+ src/backend/commands/explain.c             | 172 +++++++++-
+ src/backend/commands/explain_state.c       |   8 +
+ src/backend/executor/execAsync.c           |  22 ++
+ src/backend/executor/execMain.c            |   1 +
+ src/backend/executor/execParallel.c        | 295 ++++++++++++++++-
+ src/backend/executor/execProcnode.c        |  24 +-
+ src/backend/executor/execUtils.c           |   1 +
+ src/backend/executor/instrument.c          |   7 +
+ src/backend/executor/nodeBitmapAnd.c       |   7 +
+ src/backend/executor/nodeBitmapIndexscan.c |   7 +
+ src/backend/executor/nodeBitmapOr.c        |   7 +
+ src/backend/executor/nodeHash.c            |   7 +
+ src/backend/utils/activity/wait_event.c    | 363 +++++++++++++++++++++
+ src/bin/psql/tab-complete.in.c             |   6 +-
+ src/include/commands/explain_state.h       |   1 +
+ src/include/executor/execParallel.h        |   2 +
+ src/include/executor/instrument.h          |   1 +
+ src/include/nodes/execnodes.h              |   3 +
+ src/include/utils/wait_event.h             |  45 +++
+ src/test/regress/expected/explain.out      | 202 ++++++++++++
+ src/test/regress/sql/explain.sql           | 144 ++++++++
+ 22 files changed, 1371 insertions(+), 15 deletions(-)
+
+-- 
+2.52.0

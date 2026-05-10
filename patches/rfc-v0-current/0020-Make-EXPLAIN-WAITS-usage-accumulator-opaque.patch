@@ -1,0 +1,401 @@
+From 57df2e730fae863a088d3af3ce7f46f060ae1afe Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 03:21:36 +0500
+Subject: [RFC PATCH v0 20/22] Make EXPLAIN WAITS usage accumulator opaque
+
+---
+ src/backend/commands/explain.c          | 45 ++++++++++--------
+ src/backend/executor/execParallel.c     | 44 +++++++++--------
+ src/backend/utils/activity/wait_event.c | 63 +++++++++++++++++++++++--
+ src/include/utils/wait_event.h          | 24 +++++-----
+ 4 files changed, 121 insertions(+), 55 deletions(-)
+
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index ee69d723cd8..0e2ec510fee 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -514,7 +514,6 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ 	int			eflags;
+ 	int			instrument_option = 0;
+ 	SerializeMetrics serializeMetrics = {0};
+-	WaitEventUsage waitEventUsage;
+ 	WaitEventUsage *waitEventUsagePtr = NULL;
+ 
+ 	Assert(plannedstmt->commandType != CMD_UTILITY);
+@@ -593,9 +592,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ 
+ 		if (es->waits)
+ 		{
+-			waitEventUsagePtr = &waitEventUsage;
+-			pgstat_begin_wait_event_usage(waitEventUsagePtr,
+-										  queryDesc->estate->es_query_cxt);
++			waitEventUsagePtr =
++				pgstat_begin_wait_event_usage(queryDesc->estate->es_query_cxt);
+ 			queryDesc->estate->es_wait_event_usage = waitEventUsagePtr;
+ 		}
+ 
+@@ -4559,20 +4557,29 @@ static void
+ show_wait_event_usage(ExplainState *es, const char *labelname,
+ 					  const WaitEventUsage *usage)
+ {
++	const WaitEventUsageEntry *usage_entries;
+ 	WaitEventUsageEntry *entries;
++	uint64		overflowed_calls;
++	instr_time	overflowed_time;
++	int			nentries;
+ 
+ 	if (usage == NULL)
+ 		return;
+ 
+-	if (usage->nentries == 0 && usage->overflowed_calls == 0)
++	if (pgstat_wait_event_usage_is_empty(usage))
+ 		return;
+ 
+-	if (usage->nentries > 0)
++	nentries = pgstat_get_wait_event_usage_entries(usage, &usage_entries);
++	pgstat_get_wait_event_usage_overflow(usage,
++										 &overflowed_calls,
++										 &overflowed_time);
++
++	if (nentries > 0)
+ 	{
+-		entries = palloc_array(WaitEventUsageEntry, usage->nentries);
+-		memcpy(entries, usage->entries,
+-			   sizeof(WaitEventUsageEntry) * usage->nentries);
+-		qsort(entries, usage->nentries, sizeof(WaitEventUsageEntry),
++		entries = palloc_array(WaitEventUsageEntry, nentries);
++		memcpy(entries, usage_entries,
++			   sizeof(WaitEventUsageEntry) * nentries);
++		qsort(entries, nentries, sizeof(WaitEventUsageEntry),
+ 			  wait_event_usage_cmp);
+ 	}
+ 	else
+@@ -4584,7 +4591,7 @@ show_wait_event_usage(ExplainState *es, const char *labelname,
+ 		appendStringInfo(es->str, "%s:\n", labelname);
+ 		es->indent++;
+ 
+-		for (int i = 0; i < usage->nentries; i++)
++		for (int i = 0; i < nentries; i++)
+ 		{
+ 			const char *event_type;
+ 			const char *event_name;
+@@ -4600,24 +4607,24 @@ show_wait_event_usage(ExplainState *es, const char *labelname,
+ 							 INSTR_TIME_GET_MILLISEC(entries[i].time));
+ 		}
+ 
+-		if (usage->overflowed_calls > 0)
++		if (overflowed_calls > 0)
+ 		{
+ 			ExplainIndentText(es);
+ 			appendStringInfo(es->str,
+ 							 "Unrecorded Wait Event Calls: calls=%" PRIu64 " time=%0.3f ms\n",
+-							 usage->overflowed_calls,
+-							 INSTR_TIME_GET_MILLISEC(usage->overflowed_time));
++							 overflowed_calls,
++							 INSTR_TIME_GET_MILLISEC(overflowed_time));
+ 		}
+ 
+ 		es->indent--;
+ 	}
+ 	else
+ 	{
+-		if (usage->nentries > 0)
++		if (nentries > 0)
+ 		{
+ 			ExplainOpenGroup("Wait-Events", labelname, false, es);
+ 
+-			for (int i = 0; i < usage->nentries; i++)
++			for (int i = 0; i < nentries; i++)
+ 			{
+ 				const char *event_type;
+ 				const char *event_name;
+@@ -4642,16 +4649,16 @@ show_wait_event_usage(ExplainState *es, const char *labelname,
+ 			ExplainCloseGroup("Wait-Events", labelname, false, es);
+ 		}
+ 
+-		if (usage->overflowed_calls > 0)
++		if (overflowed_calls > 0)
+ 		{
+ 			/*
+ 			 * This is not a wait event identity, so keep it outside the
+ 			 * Wait Events array in structured output.
+ 			 */
+ 			ExplainPropertyUInteger("Unrecorded Wait Event Calls", NULL,
+-									usage->overflowed_calls, es);
++									overflowed_calls, es);
+ 			ExplainPropertyFloat("Unrecorded Wait Event Time", "ms",
+-								 INSTR_TIME_GET_MILLISEC(usage->overflowed_time),
++								 INSTR_TIME_GET_MILLISEC(overflowed_time),
+ 								 3, es);
+ 		}
+ 	}
+diff --git a/src/backend/executor/execParallel.c b/src/backend/executor/execParallel.c
+index 520b4b8484f..dcd06c718c8 100644
+--- a/src/backend/executor/execParallel.c
++++ b/src/backend/executor/execParallel.c
+@@ -1352,8 +1352,9 @@ ExecParallelAccumulateWaitEventUsageWorker(WaitEventUsage *usage,
+ 
+ 	if (worker->overflowed_calls > 0)
+ 	{
+-		usage->overflowed_calls += worker->overflowed_calls;
+-		INSTR_TIME_ADD(usage->overflowed_time, worker->overflowed_time);
++		pgstat_accumulate_wait_event_usage_overflow(usage,
++													worker->overflowed_calls,
++													&worker->overflowed_time);
+ 		worker->overflowed_calls = 0;
+ 		INSTR_TIME_SET_ZERO(worker->overflowed_time);
+ 	}
+@@ -1377,11 +1378,15 @@ ExecParallelReportWaitEventUsageWorker(SharedWaitEventUsageWorker *worker,
+ 									   dsa_area *area,
+ 									   const WaitEventUsage *usage)
+ {
++	const WaitEventUsageEntry *usage_entries;
+ 	WaitEventUsageEntry *entries;
+ 	WaitEventUsageEntry *old_entries = NULL;
+ 	dsa_pointer entries_dsa;
++	uint64		overflowed_calls;
++	instr_time	overflowed_time;
+ 	Size		entries_size;
+ 	int			old_nentries = 0;
++	int			usage_nentries;
+ 	int			new_nentries = 0;
+ 	int			i = 0;
+ 	int			j = 0;
+@@ -1390,10 +1395,15 @@ ExecParallelReportWaitEventUsageWorker(SharedWaitEventUsageWorker *worker,
+ 	Assert(area != NULL);
+ 	Assert(usage != NULL);
+ 
+-	worker->overflowed_calls += usage->overflowed_calls;
+-	INSTR_TIME_ADD(worker->overflowed_time, usage->overflowed_time);
++	usage_nentries =
++		pgstat_get_wait_event_usage_entries(usage, &usage_entries);
++	pgstat_get_wait_event_usage_overflow(usage,
++										 &overflowed_calls,
++										 &overflowed_time);
++	worker->overflowed_calls += overflowed_calls;
++	INSTR_TIME_ADD(worker->overflowed_time, overflowed_time);
+ 
+-	if (usage->nentries <= 0)
++	if (usage_nentries <= 0)
+ 		return;
+ 
+ 	if (DsaPointerIsValid(worker->entries))
+@@ -1404,25 +1414,25 @@ ExecParallelReportWaitEventUsageWorker(SharedWaitEventUsageWorker *worker,
+ 	}
+ 
+ 	entries_size = mul_size(sizeof(WaitEventUsageEntry),
+-							(Size) old_nentries + (Size) usage->nentries);
++							(Size) old_nentries + (Size) usage_nentries);
+ 	entries_dsa = dsa_allocate(area, entries_size);
+ 	entries = dsa_get_address(area, entries_dsa);
+ 
+-	while (i < old_nentries && j < usage->nentries)
++	while (i < old_nentries && j < usage_nentries)
+ 	{
+ 		WaitEventUsageEntry *entry = &entries[new_nentries];
+ 		uint32		old_info = old_entries[i].wait_event_info;
+-		uint32		new_info = usage->entries[j].wait_event_info;
++		uint32		new_info = usage_entries[j].wait_event_info;
+ 
+ 		if (old_info < new_info)
+ 			*entry = old_entries[i++];
+ 		else if (old_info > new_info)
+-			*entry = usage->entries[j++];
++			*entry = usage_entries[j++];
+ 		else
+ 		{
+ 			*entry = old_entries[i++];
+-			entry->calls += usage->entries[j].calls;
+-			INSTR_TIME_ADD(entry->time, usage->entries[j].time);
++			entry->calls += usage_entries[j].calls;
++			INSTR_TIME_ADD(entry->time, usage_entries[j].time);
+ 			j++;
+ 		}
+ 
+@@ -1431,8 +1441,8 @@ ExecParallelReportWaitEventUsageWorker(SharedWaitEventUsageWorker *worker,
+ 
+ 	while (i < old_nentries)
+ 		entries[new_nentries++] = old_entries[i++];
+-	while (j < usage->nentries)
+-		entries[new_nentries++] = usage->entries[j++];
++	while (j < usage_nentries)
++		entries[new_nentries++] = usage_entries[j++];
+ 
+ 	if (DsaPointerIsValid(worker->entries))
+ 		dsa_free(area, worker->entries);
+@@ -1781,7 +1791,6 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
+ 	QueryDesc  *queryDesc;
+ 	SharedExecutorInstrumentation *instrumentation;
+ 	SharedJitInstrumentation *jit_instrumentation;
+-	WaitEventUsage waitEventUsage;
+ 	WaitEventUsage *waitEventUsagePtr = NULL;
+ 	int			instrument_options = 0;
+ 	void	   *area_space;
+@@ -1841,11 +1850,8 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
+ 	InstrStartParallelQuery();
+ 
+ 	if (wait_event_usage != NULL)
+-	{
+-		waitEventUsagePtr = &waitEventUsage;
+-		pgstat_begin_wait_event_usage(waitEventUsagePtr,
+-									  queryDesc->estate->es_query_cxt);
+-	}
++		waitEventUsagePtr =
++			pgstat_begin_wait_event_usage(queryDesc->estate->es_query_cxt);
+ 
+ 	/*
+ 	 * Run the plan.  If we specified a tuple bound, be careful not to demand
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 67980cc0a3b..9719e38729e 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -36,6 +36,17 @@ static const char *pgstat_get_wait_client(WaitEventClient w);
+ static const char *pgstat_get_wait_ipc(WaitEventIPC w);
+ static const char *pgstat_get_wait_timeout(WaitEventTimeout w);
+ static const char *pgstat_get_wait_io(WaitEventIO w);
++struct WaitEventUsage
++{
++	struct WaitEventUsage *active_parent; /* active plan-node stack link */
++	struct WaitEventUsage *query_parent;	/* active query-level stack link */
++	struct WaitEventUsage *saved_node_usage;	/* node stack at query start */
++	int			nentries;
++	int			maxentries;
++	WaitEventUsageEntry *entries;
++	uint64		overflowed_calls;
++	instr_time	overflowed_time;
++};
+ static void WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
+ 							  uint64 calls, const instr_time *elapsed);
+ static void WaitEventUsageAddOverflow(WaitEventUsage *usage, uint64 calls,
+@@ -422,12 +433,12 @@ WaitEventUsageInit(WaitEventUsage *usage, MemoryContext memcontext)
+  * local memory.  Nested top-level collectors are kept in a query-level stack;
+  * a wait is counted once in each active collector.
+  */
+-void
+-pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
++WaitEventUsage *
++pgstat_begin_wait_event_usage(MemoryContext memcontext)
+ {
++	WaitEventUsage *usage;
+ 	bool		first;
+ 
+-	Assert(usage != NULL);
+ 	Assert(memcontext != NULL);
+ 
+ 	first = pgstat_wait_event_usage_depth == 0;
+@@ -440,7 +451,7 @@ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
+ 
+-	WaitEventUsageInit(usage, memcontext);
++	usage = pgstat_create_wait_event_usage(memcontext);
+ 	usage->query_parent = pgstat_wait_event_usage;
+ 	/*
+ 	 * A nested EXPLAIN can error out while one of its plan nodes is active,
+@@ -451,6 +462,7 @@ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 	pgstat_wait_event_usage = usage;
+ 	pgstat_wait_event_usage_depth++;
+ 	pgstat_wait_event_usage_active = true;
++	return usage;
+ }
+ 
+ /*
+@@ -579,6 +591,49 @@ pgstat_accumulate_wait_event_usage(WaitEventUsage *usage,
+ 						  &entries[i].time);
+ }
+ 
++void
++pgstat_accumulate_wait_event_usage_overflow(WaitEventUsage *usage,
++											uint64 calls,
++											const instr_time *elapsed)
++{
++	Assert(usage != NULL);
++	Assert(elapsed != NULL);
++
++	WaitEventUsageAddOverflow(usage, calls, elapsed);
++}
++
++bool
++pgstat_wait_event_usage_is_empty(const WaitEventUsage *usage)
++{
++	Assert(usage != NULL);
++
++	return usage->nentries == 0 && usage->overflowed_calls == 0;
++}
++
++int
++pgstat_get_wait_event_usage_entries(const WaitEventUsage *usage,
++									const WaitEventUsageEntry **entries)
++{
++	Assert(usage != NULL);
++	Assert(entries != NULL);
++
++	*entries = usage->entries;
++	return usage->nentries;
++}
++
++void
++pgstat_get_wait_event_usage_overflow(const WaitEventUsage *usage,
++									 uint64 *calls,
++									 instr_time *elapsed)
++{
++	Assert(usage != NULL);
++	Assert(calls != NULL);
++	Assert(elapsed != NULL);
++
++	*calls = usage->overflowed_calls;
++	*elapsed = usage->overflowed_time;
++}
++
+ /*
+  * Find the existing entry, or the insertion position for a new entry.
+  *
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 67497790307..fb197f8349f 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -22,17 +22,7 @@ typedef struct WaitEventUsageEntry
+ 	instr_time	time;
+ } WaitEventUsageEntry;
+ 
+-typedef struct WaitEventUsage
+-{
+-	struct WaitEventUsage *active_parent; /* active plan-node stack link */
+-	struct WaitEventUsage *query_parent;	/* active query-level stack link */
+-	struct WaitEventUsage *saved_node_usage;	/* node stack at query start */
+-	int			nentries;
+-	int			maxentries;
+-	WaitEventUsageEntry *entries;
+-	uint64		overflowed_calls;
+-	instr_time	overflowed_time;
+-} WaitEventUsage;
++typedef struct WaitEventUsage WaitEventUsage;
+ 
+ extern const char *pgstat_get_wait_event(uint32 wait_event_info);
+ extern const char *pgstat_get_wait_event_type(uint32 wait_event_info);
+@@ -41,12 +31,20 @@ static inline void pgstat_report_wait_end(void);
+ extern void pgstat_set_wait_event_storage(uint32 *wait_event_info);
+ extern void pgstat_reset_wait_event_storage(void);
+ extern WaitEventUsage *pgstat_create_wait_event_usage(MemoryContext memcontext);
+-extern void pgstat_begin_wait_event_usage(WaitEventUsage *usage,
+-										  MemoryContext memcontext);
++extern WaitEventUsage *pgstat_begin_wait_event_usage(MemoryContext memcontext);
+ extern void pgstat_end_wait_event_usage(WaitEventUsage *usage);
+ extern void pgstat_accumulate_wait_event_usage(WaitEventUsage *usage,
+ 											   const WaitEventUsageEntry *entries,
+ 											   int nentries);
++extern void pgstat_accumulate_wait_event_usage_overflow(WaitEventUsage *usage,
++														uint64 calls,
++														const instr_time *elapsed);
++extern bool pgstat_wait_event_usage_is_empty(const WaitEventUsage *usage);
++extern int pgstat_get_wait_event_usage_entries(const WaitEventUsage *usage,
++											   const WaitEventUsageEntry **entries);
++extern void pgstat_get_wait_event_usage_overflow(const WaitEventUsage *usage,
++												 uint64 *calls,
++												 instr_time *elapsed);
+ extern WaitEventUsage *pgstat_enter_wait_event_usage(WaitEventUsage *usage);
+ extern void pgstat_restore_wait_event_usage(WaitEventUsage *usage);
+ extern void pgstat_count_wait_event_start(uint32 wait_event_info);
+-- 
+2.52.0
+

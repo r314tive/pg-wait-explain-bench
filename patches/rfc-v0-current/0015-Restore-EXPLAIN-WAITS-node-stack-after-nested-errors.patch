@@ -1,0 +1,145 @@
+From 47d3ee3646ae8a0d88215e5d2e954458d9ba05ea Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 02:29:10 +0500
+Subject: [RFC PATCH v0 15/22] Restore EXPLAIN WAITS node stack after nested
+ errors
+
+---
+ src/backend/utils/activity/wait_event.c | 22 +++++++++++++++++-----
+ src/include/utils/wait_event.h          |  1 +
+ src/test/regress/expected/explain.out   | 25 +++++++++++++++++++++++++
+ src/test/regress/sql/explain.sql        | 20 ++++++++++++++++++++
+ 4 files changed, 63 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 7ae755d8530..61b418e8fd7 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -406,14 +406,13 @@ pgstat_init_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ void
+ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ {
++	bool		first;
++
+ 	Assert(usage != NULL);
+ 	Assert(memcontext != NULL);
+ 
+-	pgstat_init_wait_event_usage(usage, memcontext);
+-	usage->query_parent = pgstat_wait_event_usage;
+-	pgstat_wait_event_usage = usage;
+-
+-	if (pgstat_wait_event_usage_depth++ == 0)
++	first = pgstat_wait_event_usage_depth == 0;
++	if (first)
+ 	{
+ 		pgstat_wait_event_node_usage = NULL;
+ 		pgstat_wait_event_usage_node_stack = NULL;
+@@ -421,6 +420,17 @@ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 		pgstat_wait_event_usage_current = 0;
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
++
++	pgstat_init_wait_event_usage(usage, memcontext);
++	usage->query_parent = pgstat_wait_event_usage;
++	/*
++	 * A nested EXPLAIN can error out while one of its plan nodes is active,
++	 * skipping the usual node-level restore.  Remember the outer node stack so
++	 * ending this collector can discard any leaked inner node frames.
++	 */
++	usage->saved_node_usage = pgstat_wait_event_node_usage;
++	pgstat_wait_event_usage = usage;
++	pgstat_wait_event_usage_depth++;
+ }
+ 
+ /*
+@@ -438,6 +448,8 @@ pgstat_end_wait_event_usage(WaitEventUsage *usage)
+ 
+ 	pgstat_wait_event_usage = usage->query_parent;
+ 	usage->query_parent = NULL;
++	pgstat_wait_event_node_usage = usage->saved_node_usage;
++	usage->saved_node_usage = NULL;
+ 
+ 	if (--pgstat_wait_event_usage_depth == 0)
+ 	{
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 6b161fdf2e5..f14945cdb16 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -27,6 +27,7 @@ typedef struct WaitEventUsage
+ 	MemoryContext memcontext;
+ 	struct WaitEventUsage *active_parent; /* active plan-node stack link */
+ 	struct WaitEventUsage *query_parent;	/* active query-level stack link */
++	struct WaitEventUsage *saved_node_usage;	/* node stack at query start */
+ 	int			nentries;
+ 	int			maxentries;
+ 	WaitEventUsageEntry *entries;
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index 67852c5305d..275292d6172 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -157,6 +157,31 @@ select explain_filter_to_json('explain (analyze, waits, costs off, summary off,
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+ (1 row)
+ 
++rollback;
++begin;
++-- If a nested EXPLAIN errors while one of its plan nodes is active, ending
++-- that collector must restore the outer node wait-attribution stack.  The
++-- volatile division-by-zero helper keeps the error at execution time.
++create function pg_temp.explain_waits_divzero() returns int
++  language plpgsql volatile as $$begin return 1 / 0; end$$;
++create function pg_temp.nested_explain_waits_error() returns void
++  language plpgsql as
++$$
++begin
++  begin
++    perform explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.explain_waits_divzero()');
++  exception when division_by_zero then
++    null;
++  end;
++  perform pg_sleep(0.01);
++end;
++$$;
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits_error()') #> '{0,Plan,Wait Events,0}';
++                                     ?column?                                     
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
+ rollback;
+ begin;
+ create function pg_temp.parallel_pg_sleep(float8) returns void
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index 47e954a2072..9f50ef189b0 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -100,6 +100,26 @@ select explain_filter_to_json('explain (analyze, waits, costs off, summary off,
+ select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Plan,Wait Events,0}';
+ rollback;
+ begin;
++-- If a nested EXPLAIN errors while one of its plan nodes is active, ending
++-- that collector must restore the outer node wait-attribution stack.  The
++-- volatile division-by-zero helper keeps the error at execution time.
++create function pg_temp.explain_waits_divzero() returns int
++  language plpgsql volatile as $$begin return 1 / 0; end$$;
++create function pg_temp.nested_explain_waits_error() returns void
++  language plpgsql as
++$$
++begin
++  begin
++    perform explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.explain_waits_divzero()');
++  exception when division_by_zero then
++    null;
++  end;
++  perform pg_sleep(0.01);
++end;
++$$;
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits_error()') #> '{0,Plan,Wait Events,0}';
++rollback;
++begin;
+ create function pg_temp.parallel_pg_sleep(float8) returns void
+   language internal volatile parallel safe as 'pg_sleep';
+ set local debug_parallel_query = on;
+-- 
+2.52.0
+

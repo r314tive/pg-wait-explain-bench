@@ -1,0 +1,386 @@
+From ad216fd972b1378dfb9291fa94817359e1a3f7be Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Thu, 7 May 2026 09:18:42 +0500
+Subject: [RFC PATCH v0 05/22] Attribute EXPLAIN WAITS in manual executor paths
+
+---
+ src/backend/executor/execAsync.c           | 22 ++++++++++++++++++++++
+ src/backend/executor/execProcnode.c        | 20 +++++++++++++++++---
+ src/backend/executor/nodeBitmapAnd.c       |  7 +++++++
+ src/backend/executor/nodeBitmapIndexscan.c |  7 +++++++
+ src/backend/executor/nodeBitmapOr.c        |  7 +++++++
+ src/backend/executor/nodeHash.c            |  7 +++++++
+ src/backend/utils/activity/wait_event.c    | 12 +++++++++++-
+ src/test/regress/expected/explain.out      | 21 +++++++++++++++++++++
+ src/test/regress/sql/explain.sql           | 16 ++++++++++++++++
+ 9 files changed, 115 insertions(+), 4 deletions(-)
+
+diff --git a/src/backend/executor/execAsync.c b/src/backend/executor/execAsync.c
+index cf7ddbb01f4..e73ea55cf92 100644
+--- a/src/backend/executor/execAsync.c
++++ b/src/backend/executor/execAsync.c
+@@ -19,6 +19,7 @@
+ #include "executor/instrument.h"
+ #include "executor/nodeAppend.h"
+ #include "executor/nodeForeignscan.h"
++#include "utils/wait_event.h"
+ 
+ /*
+  * Asynchronously request a tuple from a designed async-capable node.
+@@ -26,12 +27,17 @@
+ void
+ ExecAsyncRequest(AsyncRequest *areq)
+ {
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	if (areq->requestee->chgParam != NULL)	/* something changed? */
+ 		ExecReScan(areq->requestee);	/* let ReScan handle this */
+ 
+ 	/* must provide our own instrumentation support */
+ 	if (areq->requestee->instrument)
+ 		InstrStartNode(areq->requestee->instrument);
++	if (areq->requestee->wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(areq->requestee->wait_event_usage);
+ 
+ 	switch (nodeTag(areq->requestee))
+ 	{
+@@ -47,6 +53,8 @@ ExecAsyncRequest(AsyncRequest *areq)
+ 	ExecAsyncResponse(areq);
+ 
+ 	/* must provide our own instrumentation support */
++	if (areq->requestee->wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (areq->requestee->instrument)
+ 		InstrStopNode(areq->requestee->instrument,
+ 					  TupIsNull(areq->result) ? 0.0 : 1.0);
+@@ -62,9 +70,14 @@ ExecAsyncRequest(AsyncRequest *areq)
+ void
+ ExecAsyncConfigureWait(AsyncRequest *areq)
+ {
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	/* must provide our own instrumentation support */
+ 	if (areq->requestee->instrument)
+ 		InstrStartNode(areq->requestee->instrument);
++	if (areq->requestee->wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(areq->requestee->wait_event_usage);
+ 
+ 	switch (nodeTag(areq->requestee))
+ 	{
+@@ -78,6 +91,8 @@ ExecAsyncConfigureWait(AsyncRequest *areq)
+ 	}
+ 
+ 	/* must provide our own instrumentation support */
++	if (areq->requestee->wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (areq->requestee->instrument)
+ 		InstrStopNode(areq->requestee->instrument, 0.0);
+ }
+@@ -88,9 +103,14 @@ ExecAsyncConfigureWait(AsyncRequest *areq)
+ void
+ ExecAsyncNotify(AsyncRequest *areq)
+ {
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	/* must provide our own instrumentation support */
+ 	if (areq->requestee->instrument)
+ 		InstrStartNode(areq->requestee->instrument);
++	if (areq->requestee->wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(areq->requestee->wait_event_usage);
+ 
+ 	switch (nodeTag(areq->requestee))
+ 	{
+@@ -106,6 +126,8 @@ ExecAsyncNotify(AsyncRequest *areq)
+ 	ExecAsyncResponse(areq);
+ 
+ 	/* must provide our own instrumentation support */
++	if (areq->requestee->wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (areq->requestee->instrument)
+ 		InstrStopNode(areq->requestee->instrument,
+ 					  TupIsNull(areq->result) ? 0.0 : 1.0);
+diff --git a/src/backend/executor/execProcnode.c b/src/backend/executor/execProcnode.c
+index 36f0a8e7e85..081855b3fed 100644
+--- a/src/backend/executor/execProcnode.c
++++ b/src/backend/executor/execProcnode.c
+@@ -492,7 +492,8 @@ ExecProcNodeFirst(PlanState *node)
+  * This has essentially the same responsibilities as ExecProcNode,
+  * but it does not do InstrStartNode/InstrStopNode (mainly because
+  * it can't tell how many returned tuples to count).  Each per-node
+- * function must provide its own instrumentation support.
++ * function must provide its own instrumentation support, including
++ * wait event attribution when enabled.
+  * ----------------------------------------------------------------
+  */
+ Node *
+@@ -769,6 +770,9 @@ ExecShutdownNode(PlanState *node)
+ static bool
+ ExecShutdownNode_walker(PlanState *node, void *context)
+ {
++	bool		node_running;
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	if (node == NULL)
+ 		return false;
+ 
+@@ -784,8 +788,14 @@ ExecShutdownNode_walker(PlanState *node, void *context)
+ 	 * has never been executed, so as to avoid incorrectly making it appear
+ 	 * that it has.
+ 	 */
+-	if (node->instrument && node->instrument->running)
++	node_running = node->instrument && node->instrument->running;
++	if (node_running)
++	{
+ 		InstrStartNode(node->instrument);
++		if (node->wait_event_usage)
++			previous_wait_event_usage =
++				pgstat_enter_wait_event_usage(node->wait_event_usage);
++	}
+ 
+ 	planstate_tree_walker(node, ExecShutdownNode_walker, context);
+ 
+@@ -814,8 +824,12 @@ ExecShutdownNode_walker(PlanState *node, void *context)
+ 	}
+ 
+ 	/* Stop the node if we started it above, reporting 0 tuples. */
+-	if (node->instrument && node->instrument->running)
++	if (node_running)
++	{
++		if (node->wait_event_usage)
++			pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 		InstrStopNode(node->instrument, 0);
++	}
+ 
+ 	return false;
+ }
+diff --git a/src/backend/executor/nodeBitmapAnd.c b/src/backend/executor/nodeBitmapAnd.c
+index 9007dda3802..e2b442bd378 100644
+--- a/src/backend/executor/nodeBitmapAnd.c
++++ b/src/backend/executor/nodeBitmapAnd.c
+@@ -32,6 +32,7 @@
+ #include "executor/instrument.h"
+ #include "executor/nodeBitmapAnd.h"
+ #include "nodes/tidbitmap.h"
++#include "utils/wait_event.h"
+ 
+ 
+ /* ----------------------------------------------------------------
+@@ -115,10 +116,14 @@ MultiExecBitmapAnd(BitmapAndState *node)
+ 	int			nplans;
+ 	int			i;
+ 	TIDBitmap  *result = NULL;
++	WaitEventUsage *previous_wait_event_usage = NULL;
+ 
+ 	/* must provide our own instrumentation support */
+ 	if (node->ps.instrument)
+ 		InstrStartNode(node->ps.instrument);
++	if (node->ps.wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->ps.wait_event_usage);
+ 
+ 	/*
+ 	 * get information from the node
+@@ -162,6 +167,8 @@ MultiExecBitmapAnd(BitmapAndState *node)
+ 		elog(ERROR, "BitmapAnd doesn't support zero inputs");
+ 
+ 	/* must provide our own instrumentation support */
++	if (node->ps.wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (node->ps.instrument)
+ 		InstrStopNode(node->ps.instrument, 0 /* XXX */ );
+ 
+diff --git a/src/backend/executor/nodeBitmapIndexscan.c b/src/backend/executor/nodeBitmapIndexscan.c
+index 7978514e1bc..c2798a81e97 100644
+--- a/src/backend/executor/nodeBitmapIndexscan.c
++++ b/src/backend/executor/nodeBitmapIndexscan.c
+@@ -28,6 +28,7 @@
+ #include "executor/nodeIndexscan.h"
+ #include "miscadmin.h"
+ #include "nodes/tidbitmap.h"
++#include "utils/wait_event.h"
+ 
+ 
+ /* ----------------------------------------------------------------
+@@ -54,10 +55,14 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
+ 	IndexScanDesc scandesc;
+ 	double		nTuples = 0;
+ 	bool		doscan;
++	WaitEventUsage *previous_wait_event_usage = NULL;
+ 
+ 	/* must provide our own instrumentation support */
+ 	if (node->ss.ps.instrument)
+ 		InstrStartNode(node->ss.ps.instrument);
++	if (node->ss.ps.wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->ss.ps.wait_event_usage);
+ 
+ 	/*
+ 	 * extract necessary information from index scan node
+@@ -116,6 +121,8 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
+ 	}
+ 
+ 	/* must provide our own instrumentation support */
++	if (node->ss.ps.wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (node->ss.ps.instrument)
+ 		InstrStopNode(node->ss.ps.instrument, nTuples);
+ 
+diff --git a/src/backend/executor/nodeBitmapOr.c b/src/backend/executor/nodeBitmapOr.c
+index 148c80fdae6..e9ee934a6f6 100644
+--- a/src/backend/executor/nodeBitmapOr.c
++++ b/src/backend/executor/nodeBitmapOr.c
+@@ -33,6 +33,7 @@
+ #include "executor/nodeBitmapOr.h"
+ #include "nodes/tidbitmap.h"
+ #include "miscadmin.h"
++#include "utils/wait_event.h"
+ 
+ 
+ /* ----------------------------------------------------------------
+@@ -116,10 +117,14 @@ MultiExecBitmapOr(BitmapOrState *node)
+ 	int			nplans;
+ 	int			i;
+ 	TIDBitmap  *result = NULL;
++	WaitEventUsage *previous_wait_event_usage = NULL;
+ 
+ 	/* must provide our own instrumentation support */
+ 	if (node->ps.instrument)
+ 		InstrStartNode(node->ps.instrument);
++	if (node->ps.wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->ps.wait_event_usage);
+ 
+ 	/*
+ 	 * get information from the node
+@@ -180,6 +185,8 @@ MultiExecBitmapOr(BitmapOrState *node)
+ 		elog(ERROR, "BitmapOr doesn't support zero inputs");
+ 
+ 	/* must provide our own instrumentation support */
++	if (node->ps.wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (node->ps.instrument)
+ 		InstrStopNode(node->ps.instrument, 0 /* XXX */ );
+ 
+diff --git a/src/backend/executor/nodeHash.c b/src/backend/executor/nodeHash.c
+index 8825bb6fa23..6e9e4b4218f 100644
+--- a/src/backend/executor/nodeHash.c
++++ b/src/backend/executor/nodeHash.c
+@@ -105,9 +105,14 @@ ExecHash(PlanState *pstate)
+ Node *
+ MultiExecHash(HashState *node)
+ {
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	/* must provide our own instrumentation support */
+ 	if (node->ps.instrument)
+ 		InstrStartNode(node->ps.instrument);
++	if (node->ps.wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->ps.wait_event_usage);
+ 
+ 	if (node->parallel_state != NULL)
+ 		MultiExecParallelHash(node);
+@@ -115,6 +120,8 @@ MultiExecHash(HashState *node)
+ 		MultiExecPrivateHash(node);
+ 
+ 	/* must provide our own instrumentation support */
++	if (node->ps.wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (node->ps.instrument)
+ 		InstrStopNode(node->ps.instrument, node->hashtable->reportTuples);
+ 
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 9bb2cdfb4fd..3d5a10b44c4 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -27,6 +27,7 @@
+ #include "storage/shmem.h"
+ #include "storage/subsystems.h"
+ #include "storage/spin.h"
++#include "utils/memutils.h"
+ #include "utils/wait_event.h"
+ 
+ 
+@@ -369,7 +370,16 @@ pgstat_init_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 	Assert(memcontext != NULL);
+ 
+ 	memset(usage, 0, sizeof(WaitEventUsage));
+-	usage->memcontext = memcontext;
++
++	/*
++	 * Wait events may end inside critical sections, for example while
++	 * performing synchronous I/O.  Keep usage entries in a dedicated context
++	 * where the memory manager permits that accounting path to grow.
++	 */
++	usage->memcontext = AllocSetContextCreate(memcontext,
++											  "Wait Event Usage",
++											  ALLOCSET_SMALL_SIZES);
++	MemoryContextAllowInCriticalSection(usage->memcontext, true);
+ }
+ 
+ /*
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index 046596a6f6f..49b38e01e8e 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -149,6 +149,27 @@ select jsonb_path_query_first(
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+ (1 row)
+ 
++rollback;
++begin;
++create function pg_temp.explain_waits_sleep_int(int) returns int
++  language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
++create temp table explain_waits_bitmap (a int);
++insert into explain_waits_bitmap select g from generate_series(1, 10) g;
++create index explain_waits_bitmap_a_idx on explain_waits_bitmap(a);
++analyze explain_waits_bitmap;
++set local enable_seqscan = off;
++set local enable_indexscan = off;
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from explain_waits_bitmap
++                         where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
++  '$.** ? (@."Node Type" == "Bitmap Index Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
++                              jsonb_path_query_first                              
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
+ rollback;
+ explain (waits) select 1;
+ ERROR:  EXPLAIN option WAITS requires ANALYZE
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index c736a70769b..655f74a3e78 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -90,6 +90,22 @@ select jsonb_path_query_first(
+   '$.**."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
+ );
+ rollback;
++begin;
++create function pg_temp.explain_waits_sleep_int(int) returns int
++  language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
++create temp table explain_waits_bitmap (a int);
++insert into explain_waits_bitmap select g from generate_series(1, 10) g;
++create index explain_waits_bitmap_a_idx on explain_waits_bitmap(a);
++analyze explain_waits_bitmap;
++set local enable_seqscan = off;
++set local enable_indexscan = off;
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from explain_waits_bitmap
++                         where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
++  '$.** ? (@."Node Type" == "Bitmap Index Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
++rollback;
+ explain (waits) select 1;
+ 
+ \a
+-- 
+2.52.0
+

@@ -1,0 +1,34 @@
+From 861b5a6783c42199212e8ef4170d5ffe27fc4d8c Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 03:02:02 +0500
+Subject: [RFC PATCH v0 17/22] Mark EXPLAIN WAITS accounting as unlikely
+
+---
+ src/include/utils/wait_event.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 3037ed346a2..87696e5a806 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -100,7 +100,7 @@ extern char **GetWaitEventCustomNames(uint32 classId, int *nwaitevents);
+ static inline void
+ pgstat_report_wait_start(uint32 wait_event_info)
+ {
+-	if (pgstat_wait_event_usage_depth > 0)
++	if (unlikely(pgstat_wait_event_usage_depth > 0))
+ 		pgstat_count_wait_event_start(wait_event_info);
+ 
+ 	/*
+@@ -119,7 +119,7 @@ pgstat_report_wait_start(uint32 wait_event_info)
+ static inline void
+ pgstat_report_wait_end(void)
+ {
+-	if (pgstat_wait_event_usage_depth > 0)
++	if (unlikely(pgstat_wait_event_usage_depth > 0))
+ 		pgstat_count_wait_event_end();
+ 
+ 	/* see pgstat_report_wait_start() */
+-- 
+2.52.0
+

@@ -1,0 +1,222 @@
+From f857f5a6cd16ef24fd835f53ff2724bf39f577ce Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 02:23:42 +0500
+Subject: [RFC PATCH v0 14/22] Clarify EXPLAIN WAITS output semantics
+
+---
+ doc/src/sgml/ref/explain.sgml         | 19 ++++++++++++++-----
+ src/backend/commands/explain.c        | 23 ++++++++++++-----------
+ src/test/regress/expected/explain.out |  8 ++++----
+ src/test/regress/sql/explain.sql      |  6 +++---
+ 4 files changed, 33 insertions(+), 23 deletions(-)
+
+diff --git a/doc/src/sgml/ref/explain.sgml b/doc/src/sgml/ref/explain.sgml
+index 38ebf1114c0..d699b215120 100644
+--- a/doc/src/sgml/ref/explain.sgml
++++ b/doc/src/sgml/ref/explain.sgml
+@@ -329,22 +329,31 @@ ROLLBACK;
+       If <command>EXPLAIN</command> cannot grow its per-query or per-node wait
+       event storage without risking an error while a wait is ending, waits
+       whose exact event identifier could not be stored are accumulated in an
+-      <literal>Unrecorded Wait Events</literal> counter and
++      <literal>Unrecorded Wait Event Calls</literal> counter and
+       <literal>Unrecorded Wait Event Time</literal> total.  This is a
+       reporting fallback under memory pressure, not a wait event emitted by
+       server instrumentation.
+      </para>
+ 
+      <para>
+-      The top-level <literal>Wait Events</literal> summary counts each wait
+-      once for the statement, including waits reported by parallel workers.
+-      Plan nodes can also show <literal>Wait Events</literal>.  Node-level
+-      wait events are inclusive, like plan node timing in
++      The top-level <literal>Statement Wait Events</literal> summary counts
++      each wait once for the statement, including waits reported by parallel
++      workers.  Nested <command>EXPLAIN (ANALYZE, WAITS)</command> commands
++      maintain separate statement-level summaries; a wait is counted once in
++      each active summary.  Plan nodes can also show <literal>Wait
++      Events</literal>.  Node-level wait events are inclusive, like plan node
++      timing in
+       <command>EXPLAIN ANALYZE</command>: a wait is attributed to every
+       active plan node when the wait begins.  Therefore node-level wait event
+       times should not be summed to compute the statement total.
+      </para>
+ 
++     <para>
++      The overhead of this option depends on the number of waits observed and,
++      for node-level output, on the number of active plan nodes when each wait
++      begins.
++     </para>
++
+      <para>
+       This parameter may only be used when <literal>ANALYZE</literal> is also
+       enabled.  It defaults to <literal>FALSE</literal>.
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 788decf7c82..9c198f8e599 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -151,7 +151,7 @@ static bool peek_buffer_usage(ExplainState *es, const BufferUsage *usage);
+ static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
+ static void show_wal_usage(ExplainState *es, const WalUsage *usage);
+ static int	wait_event_usage_cmp(const void *a, const void *b);
+-static void show_wait_event_usage(ExplainState *es,
++static void show_wait_event_usage(ExplainState *es, const char *labelname,
+ 								  const WaitEventUsage *usage);
+ static void show_memory_counters(ExplainState *es,
+ 								 const MemoryContextCounters *mem_counters);
+@@ -219,7 +219,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
+ 		 * In the case of an INSTEAD NOTHING, tell at least that.  But in
+ 		 * non-text format, the output is delimited, so this isn't necessary.
+ 		 */
+-		if (es->format == EXPLAIN_FORMAT_TEXT)
++	if (es->format == EXPLAIN_FORMAT_TEXT)
+ 			appendStringInfoString(es->str, "Query rewrites to nothing\n");
+ 	}
+ 	else
+@@ -634,7 +634,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ 	ExplainPrintPlan(es, queryDesc);
+ 
+ 	if (waitEventUsagePtr)
+-		show_wait_event_usage(es, waitEventUsagePtr);
++		show_wait_event_usage(es, "Statement Wait Events", waitEventUsagePtr);
+ 
+ 	/* Show buffer and/or memory usage in planning */
+ 	if (peek_buffer_usage(es, bufusage) || mem_counters)
+@@ -2335,7 +2335,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
+ 	if (es->wal && planstate->instrument)
+ 		show_wal_usage(es, &planstate->instrument->instr.walusage);
+ 	if (es->waits)
+-		show_wait_event_usage(es, planstate->wait_event_usage);
++		show_wait_event_usage(es, "Wait Events", planstate->wait_event_usage);
+ 
+ 	/* Prepare per-worker buffer/WAL usage */
+ 	if (es->workers_state && (es->buffers || es->wal) && es->verbose)
+@@ -4556,7 +4556,8 @@ wait_event_usage_cmp(const void *a, const void *b)
+ }
+ 
+ static void
+-show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
++show_wait_event_usage(ExplainState *es, const char *labelname,
++					  const WaitEventUsage *usage)
+ {
+ 	WaitEventUsageEntry *entries;
+ 
+@@ -4577,10 +4578,10 @@ show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
+ 	else
+ 		entries = NULL;
+ 
+-	if (es->format == EXPLAIN_FORMAT_TEXT)
++		if (es->format == EXPLAIN_FORMAT_TEXT)
+ 	{
+ 		ExplainIndentText(es);
+-		appendStringInfoString(es->str, "Wait Events:\n");
++		appendStringInfo(es->str, "%s:\n", labelname);
+ 		es->indent++;
+ 
+ 		for (int i = 0; i < usage->nentries; i++)
+@@ -4603,7 +4604,7 @@ show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
+ 		{
+ 			ExplainIndentText(es);
+ 			appendStringInfo(es->str,
+-							 "Unrecorded Wait Events: calls=%" PRIu64 " time=%0.3f ms\n",
++							 "Unrecorded Wait Event Calls: calls=%" PRIu64 " time=%0.3f ms\n",
+ 							 usage->overflowed_calls,
+ 							 INSTR_TIME_GET_MILLISEC(usage->overflowed_time));
+ 		}
+@@ -4614,7 +4615,7 @@ show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
+ 	{
+ 		if (usage->nentries > 0)
+ 		{
+-			ExplainOpenGroup("Wait-Events", "Wait Events", false, es);
++			ExplainOpenGroup("Wait-Events", labelname, false, es);
+ 
+ 			for (int i = 0; i < usage->nentries; i++)
+ 			{
+@@ -4638,7 +4639,7 @@ show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
+ 				ExplainCloseGroup("Wait-Event", NULL, true, es);
+ 			}
+ 
+-			ExplainCloseGroup("Wait-Events", "Wait Events", false, es);
++			ExplainCloseGroup("Wait-Events", labelname, false, es);
+ 		}
+ 
+ 		if (usage->overflowed_calls > 0)
+@@ -4647,7 +4648,7 @@ show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
+ 			 * This is not a wait event identity, so keep it outside the
+ 			 * Wait Events array in structured output.
+ 			 */
+-			ExplainPropertyUInteger("Unrecorded Wait Events", NULL,
++			ExplainPropertyUInteger("Unrecorded Wait Event Calls", NULL,
+ 									usage->overflowed_calls, es);
+ 			ExplainPropertyFloat("Unrecorded Wait Event Time", "ms",
+ 								 INSTR_TIME_GET_MILLISEC(usage->overflowed_time),
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index 5af317ad97e..67852c5305d 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -121,11 +121,11 @@ select explain_filter('explain (analyze, waits, costs off, summary off, timing o
+  Result (actual rows=N.N loops=N)
+    Wait Events:
+      Timeout:PgSleep calls=N time=N.N ms
+- Wait Events:
++ Statement Wait Events:
+    Timeout:PgSleep calls=N time=N.N ms
+ (5 rows)
+ 
+-select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Wait Events,0}';
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Statement Wait Events,0}';
+                                      ?column?                                     
+ ----------------------------------------------------------------------------------
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+@@ -145,7 +145,7 @@ begin
+   perform explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)');
+ end;
+ $$;
+-select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Wait Events,0}';
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Statement Wait Events,0}';
+                                      ?column?                                     
+ ----------------------------------------------------------------------------------
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+@@ -166,7 +166,7 @@ set local max_parallel_workers_per_gather = 1;
+ select jsonb_path_query_first(
+   explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
+                          select pg_temp.parallel_pg_sleep(0.01)
+-                         from tenk1 where unique1 = 1') #> '{0,Wait Events}',
++                         from tenk1 where unique1 = 1') #> '{0,Statement Wait Events}',
+   '$[*] ? (@."Wait Event" == "PgSleep")'
+ );
+                               jsonb_path_query_first                              
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index 7385ed99203..47e954a2072 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -86,7 +86,7 @@ select explain_filter('explain (buffers, format text) select * from int8_tbl i8'
+ 
+ -- WAITS option
+ select explain_filter('explain (analyze, waits, costs off, summary off, timing off, buffers off) select pg_sleep(0.01)');
+-select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Wait Events,0}';
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Statement Wait Events,0}';
+ select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Plan,Wait Events,0}';
+ begin;
+ create function pg_temp.nested_explain_waits() returns void
+@@ -96,7 +96,7 @@ begin
+   perform explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)');
+ end;
+ $$;
+-select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Wait Events,0}';
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Statement Wait Events,0}';
+ select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Plan,Wait Events,0}';
+ rollback;
+ begin;
+@@ -107,7 +107,7 @@ set local max_parallel_workers_per_gather = 1;
+ select jsonb_path_query_first(
+   explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
+                          select pg_temp.parallel_pg_sleep(0.01)
+-                         from tenk1 where unique1 = 1') #> '{0,Wait Events}',
++                         from tenk1 where unique1 = 1') #> '{0,Statement Wait Events}',
+   '$[*] ? (@."Wait Event" == "PgSleep")'
+ );
+ select jsonb_path_query_first(
+-- 
+2.52.0
+

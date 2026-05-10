@@ -1,0 +1,10 @@
+*.o
+*.bc
+*.dylib
+.DS_Store
+__pycache__/
+
+/data/
+/install/
+/logs/
+/worktrees/

@@ -1,0 +1,215 @@
+From 68fdbf1f178b7d957bce58f62d4c2faea5791b0a Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Thu, 7 May 2026 09:35:42 +0500
+Subject: [RFC PATCH v0 07/22] Make EXPLAIN WAITS node attribution inclusive
+
+---
+ doc/pg_wait_explain_diary.md            | 55 +++++++++++++++++++++++++
+ src/backend/utils/activity/wait_event.c | 27 +++++++++---
+ src/include/utils/wait_event.h          |  1 +
+ src/test/regress/expected/explain.out   | 14 +++++++
+ src/test/regress/sql/explain.sql        |  9 ++++
+ 5 files changed, 101 insertions(+), 5 deletions(-)
+ create mode 100644 doc/pg_wait_explain_diary.md
+
+diff --git a/doc/pg_wait_explain_diary.md b/doc/pg_wait_explain_diary.md
+new file mode 100644
+index 00000000000..4dca78f8c64
+--- /dev/null
++++ b/doc/pg_wait_explain_diary.md
+@@ -0,0 +1,55 @@
++# EXPLAIN WAITS Patch Diary
++
++Branch-local research notes for `r314tive/pg-wait-explain-mvp`.
++This file records non-obvious observations, assumptions, and test scaffolding.
++It is not intended to be submitted upstream as-is.
++
++## 2026-05-07
++
++### Wait event identity
++
++The patch must not hardcode native wait event type/name lists.  Runtime
++accounting stores `wait_event_info`; display resolves type/name through
++`pgstat_get_wait_event_type()` and `pgstat_get_wait_event()`.  This keeps the
++feature aligned with core-generated wait event metadata and also preserves
++dynamic custom wait event names.
++
++### Query-level vs per-node accounting
++
++Query-level `EXPLAIN (ANALYZE, WAITS)` accounting records each completed wait
++once per backend or parallel worker and then aggregates workers into the
++leader.  This is the non-duplicated total for the query.
++
++Per-node accounting follows the active executor instrumentation stack.  A wait
++is added to every active plan node, so the per-node view is inclusive like
++`EXPLAIN ANALYZE` node timing.  Therefore per-node wait times are not additive:
++their sum can exceed the query-level wait total.
++
++### Critical-section allocation
++
++Regression testing through a Bitmap Index Scan exposed that an I/O wait can end
++inside a critical section.  The wait usage accumulator can need to grow on that
++first observed event, so its entries live in a dedicated memory context marked
++with `MemoryContextAllowInCriticalSection()`.  This is required for correctness;
++it is not an event-specific exception.
++
++### Bitmap regression scaffolding
++
++The Bitmap Index Scan regression case uses test-only scaffolding:
++
++- `enable_seqscan = off` and `enable_indexscan = off` force a deterministic
++  Bitmap Heap Scan / Bitmap Index Scan plan shape.
++- The `STABLE` PL/pgSQL wrapper around `pg_sleep()` lets the expression be used
++  as an index runtime key while preventing SQL inlining from moving the wait
++  outside the Bitmap Index Scan boundary.
++
++These choices are regression-test constraints only.  The runtime feature does
++not depend on those planner settings, function volatility, or a hardcoded wait
++event name.
++
++### Current nested collection boundary
++
++Nested top-level wait collection is still treated as part of the outer
++collection.  The stack introduced here is the active plan-node stack for
++per-node attribution, not an independent stack of query-level collection
++contexts.
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 3d5a10b44c4..9615e6a9f5c 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -48,6 +48,13 @@ uint32	   *my_wait_event_info = &local_my_wait_event_info;
+ 
+ int			pgstat_wait_event_usage_depth = 0;
+ static WaitEventUsage *pgstat_wait_event_usage = NULL;
++
++/*
++ * Top of the active executor node stack.  Query-level wait accounting records
++ * each wait once in pgstat_wait_event_usage.  Per-node wait accounting records
++ * each wait in every active plan node, matching the inclusive timing semantics
++ * of EXPLAIN ANALYZE plan nodes.
++ */
+ static WaitEventUsage *pgstat_wait_event_node_usage = NULL;
+ static uint32 pgstat_wait_event_usage_current = 0;
+ static instr_time pgstat_wait_event_usage_start;
+@@ -387,9 +394,9 @@ pgstat_init_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+  *
+  * This is intended for short-lived instrumentation such as EXPLAIN ANALYZE.
+  * It records waits observed through pgstat_report_wait_start/end in backend
+- * local memory.  Nested collection is deliberately treated as part of the
+- * outer collection for now; callers that want independent nested accounting
+- * need a stack of WaitEventUsage contexts.
++ * local memory.  Nested top-level collection is deliberately treated as part
++ * of the outer collection for now; callers that want independent nested
++ * accounting need a stack of query-level WaitEventUsage contexts.
+  */
+ void
+ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+@@ -433,6 +440,9 @@ pgstat_enter_wait_event_usage(WaitEventUsage *usage)
+ {
+ 	WaitEventUsage *previous = pgstat_wait_event_node_usage;
+ 
++	Assert(usage != NULL);
++
++	usage->active_parent = previous;
+ 	pgstat_wait_event_node_usage = usage;
+ 	return previous;
+ }
+@@ -440,6 +450,11 @@ pgstat_enter_wait_event_usage(WaitEventUsage *usage)
+ void
+ pgstat_restore_wait_event_usage(WaitEventUsage *usage)
+ {
++	Assert(pgstat_wait_event_node_usage == NULL ||
++		   pgstat_wait_event_node_usage->active_parent == usage);
++
++	if (pgstat_wait_event_node_usage != NULL)
++		pgstat_wait_event_node_usage->active_parent = NULL;
+ 	pgstat_wait_event_node_usage = usage;
+ }
+ 
+@@ -484,8 +499,10 @@ pgstat_count_wait_event_end(void)
+ 					  pgstat_wait_event_usage_current,
+ 					  1,
+ 					  &elapsed);
+-	if (pgstat_wait_event_node_usage != NULL)
+-		WaitEventUsageAdd(pgstat_wait_event_node_usage,
++	for (WaitEventUsage *node_usage = pgstat_wait_event_node_usage;
++		 node_usage != NULL;
++		 node_usage = node_usage->active_parent)
++		WaitEventUsageAdd(node_usage,
+ 						  pgstat_wait_event_usage_current,
+ 						  1,
+ 						  &elapsed);
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 64411288403..e3eb76c98eb 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -25,6 +25,7 @@ typedef struct WaitEventUsageEntry
+ typedef struct WaitEventUsage
+ {
+ 	MemoryContext memcontext;
++	struct WaitEventUsage *active_parent;
+ 	int			nentries;
+ 	int			maxentries;
+ 	WaitEventUsageEntry *entries;
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index c086fa48d80..b51a4628eda 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -157,6 +157,9 @@ begin;
+ -- inlining from moving pg_sleep() out of the Bitmap Index Scan boundary.
+ -- The planner GUCs below are likewise test-only scaffolding to make the
+ -- node shape deterministic.
++-- The two JSONPath checks verify inclusive per-node attribution: the same
++-- runtime-key wait appears on the Bitmap Index Scan and its Bitmap Heap Scan
++-- parent, while query-level wait accounting still counts the wait once.
+ create function pg_temp.explain_waits_sleep_int(int) returns int
+   language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
+ create temp table explain_waits_bitmap (a int);
+@@ -176,6 +179,17 @@ select jsonb_path_query_first(
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+ (1 row)
+ 
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from explain_waits_bitmap
++                         where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
++  '$.** ? (@."Node Type" == "Bitmap Heap Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
++                              jsonb_path_query_first                              
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
+ rollback;
+ explain (waits) select 1;
+ ERROR:  EXPLAIN option WAITS requires ANALYZE
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index bd196f248db..543ce8b6eeb 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -97,6 +97,9 @@ begin;
+ -- inlining from moving pg_sleep() out of the Bitmap Index Scan boundary.
+ -- The planner GUCs below are likewise test-only scaffolding to make the
+ -- node shape deterministic.
++-- The two JSONPath checks verify inclusive per-node attribution: the same
++-- runtime-key wait appears on the Bitmap Index Scan and its Bitmap Heap Scan
++-- parent, while query-level wait accounting still counts the wait once.
+ create function pg_temp.explain_waits_sleep_int(int) returns int
+   language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
+ create temp table explain_waits_bitmap (a int);
+@@ -111,6 +114,12 @@ select jsonb_path_query_first(
+                          where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
+   '$.** ? (@."Node Type" == "Bitmap Index Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
+ );
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from explain_waits_bitmap
++                         where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
++  '$.** ? (@."Node Type" == "Bitmap Heap Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
+ rollback;
+ explain (waits) select 1;
+ 
+-- 
+2.52.0
+

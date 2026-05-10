@@ -1,0 +1,90 @@
+Pager usage is off.
+Timing is on.
+CREATE FUNCTION
+Time: 384.653 ms
+                                                       version                                                       
+---------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 19devel on aarch64-apple-darwin25.4.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit
+(1 row)
+
+Time: 0.370 ms
+ jit 
+-----
+ off
+(1 row)
+
+Time: 0.135 ms
+ track_io_timing 
+-----------------
+ off
+(1 row)
+
+Time: 0.100 ms
+ bench_wait_loop 
+-----------------
+          100000
+(1 row)
+
+Time: 0.278 ms
+BENCH c_wait_loop_disabled_5m
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 4.061 ms
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 4.527 ms
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 4.259 ms
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 2.936 ms
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 3.842 ms
+BENCH c_wait_loop_explain_no_waits_5m
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.242 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.599 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.119 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 1.915 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.155 ms

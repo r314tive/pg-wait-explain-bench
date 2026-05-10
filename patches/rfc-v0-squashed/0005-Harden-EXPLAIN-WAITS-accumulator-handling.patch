@@ -1,0 +1,300 @@
+From 7535889991ec4af6104e4ac241f9fca7b603258e Mon Sep 17 00:00:00 2001
+Message-ID: <7535889991ec4af6104e4ac241f9fca7b603258e.1778280923.git.tanswis42@gmail.com>
+In-Reply-To: <cover.1778280923.git.tanswis42@gmail.com>
+References: <cover.1778280923.git.tanswis42@gmail.com>
+From: Ilmar Yunusov <tanswis42@gmail.com>
+Date: Sat, 9 May 2026 03:45:44 +0500
+Subject: [RFC PATCH v0 5/7] Harden EXPLAIN WAITS accumulator handling
+
+---
+ doc/src/sgml/ref/explain.sgml           |  15 ++--
+ src/backend/commands/explain.c          |   2 +-
+ src/backend/executor/execProcnode.c     |  11 +--
+ src/backend/utils/activity/wait_event.c | 100 ++++++++++--------------
+ src/include/utils/wait_event.h          |  10 +--
+ 5 files changed, 56 insertions(+), 82 deletions(-)
+
+diff --git a/doc/src/sgml/ref/explain.sgml b/doc/src/sgml/ref/explain.sgml
+index d699b215120..7fa4b1cd955 100644
+--- a/doc/src/sgml/ref/explain.sgml
++++ b/doc/src/sgml/ref/explain.sgml
+@@ -326,13 +326,14 @@ ROLLBACK;
+      </para>
+ 
+      <para>
+-      If <command>EXPLAIN</command> cannot grow its per-query or per-node wait
+-      event storage without risking an error while a wait is ending, waits
+-      whose exact event identifier could not be stored are accumulated in an
+-      <literal>Unrecorded Wait Event Calls</literal> counter and
+-      <literal>Unrecorded Wait Event Time</literal> total.  This is a
+-      reporting fallback under memory pressure, not a wait event emitted by
+-      server instrumentation.
++      Each statement and plan-node accumulator preallocates storage for up to
++      <literal>64</literal> distinct wait event identifiers.  This bound
++      avoids memory allocation while a wait is ending.  If more distinct wait
++      event identifiers are observed, waits whose exact event identifier could
++      not be stored are accumulated in an <literal>Unrecorded Wait Event
++      Calls</literal> counter and <literal>Unrecorded Wait Event Time</literal>
++      total.  This is a reporting fallback, not a wait event emitted by server
++      instrumentation.
+      </para>
+ 
+      <para>
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 9c198f8e599..ee69d723cd8 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -4578,7 +4578,7 @@ show_wait_event_usage(ExplainState *es, const char *labelname,
+ 	else
+ 		entries = NULL;
+ 
+-		if (es->format == EXPLAIN_FORMAT_TEXT)
++	if (es->format == EXPLAIN_FORMAT_TEXT)
+ 	{
+ 		ExplainIndentText(es);
+ 		appendStringInfo(es->str, "%s:\n", labelname);
+diff --git a/src/backend/executor/execProcnode.c b/src/backend/executor/execProcnode.c
+index 081855b3fed..deee14839f2 100644
+--- a/src/backend/executor/execProcnode.c
++++ b/src/backend/executor/execProcnode.c
+@@ -417,15 +417,8 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
+ 		result->instrument = InstrAllocNode(estate->es_instrument,
+ 											result->async_capable);
+ 	if (estate->es_instrument & INSTRUMENT_WAITS)
+-	{
+-		MemoryContext oldcontext;
+-
+-		oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
+-		result->wait_event_usage = palloc_object(WaitEventUsage);
+-		pgstat_init_wait_event_usage(result->wait_event_usage,
+-									 estate->es_query_cxt);
+-		MemoryContextSwitchTo(oldcontext);
+-	}
++		result->wait_event_usage =
++			pgstat_create_wait_event_usage(estate->es_query_cxt);
+ 
+ 	return result;
+ }
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 61b418e8fd7..67980cc0a3b 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -27,7 +27,6 @@
+ #include "storage/shmem.h"
+ #include "storage/subsystems.h"
+ #include "storage/spin.h"
+-#include "utils/memutils.h"
+ #include "utils/wait_event.h"
+ 
+ 
+@@ -43,15 +42,25 @@ static void WaitEventUsageAddOverflow(WaitEventUsage *usage, uint64 calls,
+ 									  const instr_time *elapsed);
+ static int	WaitEventUsageFind(const WaitEventUsage *usage,
+ 							   uint32 wait_event_info, bool *found);
++static void WaitEventUsageInit(WaitEventUsage *usage,
++							   MemoryContext memcontext);
+ 
+ 
+ static uint32 local_my_wait_event_info;
+ uint32	   *my_wait_event_info = &local_my_wait_event_info;
+ 
+-#define WAIT_EVENT_USAGE_INITIAL_EVENTS	16
++/*
++ * Hardcoded limit: each EXPLAIN WAITS statement-level or plan-node accumulator
++ * can record this many distinct wait event identities without allocating while
++ * waits are ending.  Additional distinct wait identities are accounted for in
++ * the overflow bucket.
++ */
++#define WAIT_EVENT_USAGE_MAX_EVENTS		64
+ 
+-int			pgstat_wait_event_usage_depth = 0;
++/* Fast-path flag exported for inline pgstat_report_wait_start/end(). */
++bool		pgstat_wait_event_usage_active = false;
+ static WaitEventUsage *pgstat_wait_event_usage = NULL;
++static int	pgstat_wait_event_usage_depth = 0;
+ 
+ /*
+  * Top of the active executor node and query-level stacks.  Query-level wait
+@@ -373,26 +382,36 @@ pgstat_reset_wait_event_storage(void)
+ 	my_wait_event_info = &local_my_wait_event_info;
+ }
+ 
++/*
++ * Allocate and initialize a wait event usage accumulator.
++ */
++WaitEventUsage *
++pgstat_create_wait_event_usage(MemoryContext memcontext)
++{
++	WaitEventUsage *usage;
++
++	Assert(memcontext != NULL);
++
++	usage = MemoryContextAlloc(memcontext, sizeof(WaitEventUsage));
++	WaitEventUsageInit(usage, memcontext);
++	return usage;
++}
++
+ /*
+  * Initialize a wait event usage accumulator.
+  */
+-void
+-pgstat_init_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
++static void
++WaitEventUsageInit(WaitEventUsage *usage, MemoryContext memcontext)
+ {
+ 	Assert(usage != NULL);
+ 	Assert(memcontext != NULL);
+ 
+ 	memset(usage, 0, sizeof(WaitEventUsage));
+ 
+-	/*
+-	 * Wait events may end inside critical sections, for example while
+-	 * performing synchronous I/O.  Keep usage entries in a dedicated context
+-	 * where the memory manager permits that accounting path to grow.
+-	 */
+-	usage->memcontext = AllocSetContextCreate(memcontext,
+-											  "Wait Event Usage",
+-											  ALLOCSET_SMALL_SIZES);
+-	MemoryContextAllowInCriticalSection(usage->memcontext, true);
++	usage->entries = MemoryContextAlloc(memcontext,
++										sizeof(WaitEventUsageEntry) *
++										WAIT_EVENT_USAGE_MAX_EVENTS);
++	usage->maxentries = WAIT_EVENT_USAGE_MAX_EVENTS;
+ }
+ 
+ /*
+@@ -421,7 +440,7 @@ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
+ 
+-	pgstat_init_wait_event_usage(usage, memcontext);
++	WaitEventUsageInit(usage, memcontext);
+ 	usage->query_parent = pgstat_wait_event_usage;
+ 	/*
+ 	 * A nested EXPLAIN can error out while one of its plan nodes is active,
+@@ -431,6 +450,7 @@ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 	usage->saved_node_usage = pgstat_wait_event_node_usage;
+ 	pgstat_wait_event_usage = usage;
+ 	pgstat_wait_event_usage_depth++;
++	pgstat_wait_event_usage_active = true;
+ }
+ 
+ /*
+@@ -453,6 +473,7 @@ pgstat_end_wait_event_usage(WaitEventUsage *usage)
+ 
+ 	if (--pgstat_wait_event_usage_depth == 0)
+ 	{
++		pgstat_wait_event_usage_active = false;
+ 		pgstat_wait_event_usage = NULL;
+ 		pgstat_wait_event_node_usage = NULL;
+ 		pgstat_wait_event_usage_node_stack = NULL;
+@@ -602,52 +623,13 @@ WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
+ 	{
+ 		if (usage->nentries >= usage->maxentries)
+ 		{
+-			int			newmaxentries;
+-			Size		entries_size;
+-			WaitEventUsageEntry *newentries;
+-
+-			if (usage->maxentries > 0)
+-			{
+-				if ((Size) usage->maxentries >
+-					MaxAllocSize / sizeof(WaitEventUsageEntry) / 2)
+-				{
+-					WaitEventUsageAddOverflow(usage, calls, elapsed);
+-					return;
+-				}
+-
+-				newmaxentries = usage->maxentries * 2;
+-			}
+-			else
+-				newmaxentries = WAIT_EVENT_USAGE_INITIAL_EVENTS;
+-
+-			if ((Size) newmaxentries >
+-				MaxAllocSize / sizeof(WaitEventUsageEntry))
+-			{
+-				WaitEventUsageAddOverflow(usage, calls, elapsed);
+-				return;
+-			}
+-
+-			entries_size = sizeof(WaitEventUsageEntry) * newmaxentries;
+ 			/*
+-			 * Wait completion can happen in a critical section, so growth
+-			 * must not throw ERROR.  If storage cannot be grown without
+-			 * throwing, preserve total wait time in the overflow bucket.
++			 * Wait-end accounting must not allocate: it can run in a critical
++			 * section.  Preserve total calls/time without the exact event
++			 * identity once preallocated storage is full.
+ 			 */
+-			if (usage->entries)
+-				newentries = repalloc_extended(usage->entries, entries_size,
+-											   MCXT_ALLOC_NO_OOM);
+-			else
+-				newentries = MemoryContextAllocExtended(usage->memcontext,
+-														entries_size,
+-														MCXT_ALLOC_NO_OOM);
+-			if (newentries == NULL)
+-			{
+-				WaitEventUsageAddOverflow(usage, calls, elapsed);
+-				return;
+-			}
+-
+-			usage->entries = newentries;
+-			usage->maxentries = newmaxentries;
++			WaitEventUsageAddOverflow(usage, calls, elapsed);
++			return;
+ 		}
+ 
+ 		if (idx < usage->nentries)
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index f14945cdb16..67497790307 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -24,7 +24,6 @@ typedef struct WaitEventUsageEntry
+ 
+ typedef struct WaitEventUsage
+ {
+-	MemoryContext memcontext;
+ 	struct WaitEventUsage *active_parent; /* active plan-node stack link */
+ 	struct WaitEventUsage *query_parent;	/* active query-level stack link */
+ 	struct WaitEventUsage *saved_node_usage;	/* node stack at query start */
+@@ -41,8 +40,7 @@ static inline void pgstat_report_wait_start(uint32 wait_event_info);
+ static inline void pgstat_report_wait_end(void);
+ extern void pgstat_set_wait_event_storage(uint32 *wait_event_info);
+ extern void pgstat_reset_wait_event_storage(void);
+-extern void pgstat_init_wait_event_usage(WaitEventUsage *usage,
+-										 MemoryContext memcontext);
++extern WaitEventUsage *pgstat_create_wait_event_usage(MemoryContext memcontext);
+ extern void pgstat_begin_wait_event_usage(WaitEventUsage *usage,
+ 										  MemoryContext memcontext);
+ extern void pgstat_end_wait_event_usage(WaitEventUsage *usage);
+@@ -55,7 +53,7 @@ extern void pgstat_count_wait_event_start(uint32 wait_event_info);
+ extern void pgstat_count_wait_event_end(void);
+ 
+ extern PGDLLIMPORT uint32 *my_wait_event_info;
+-extern PGDLLIMPORT int pgstat_wait_event_usage_depth;
++extern PGDLLIMPORT bool pgstat_wait_event_usage_active;
+ 
+ 
+ /*
+@@ -101,7 +99,7 @@ extern char **GetWaitEventCustomNames(uint32 classId, int *nwaitevents);
+ static inline void
+ pgstat_report_wait_start(uint32 wait_event_info)
+ {
+-	if (pgstat_wait_event_usage_depth > 0)
++	if (unlikely(pgstat_wait_event_usage_active))
+ 		pgstat_count_wait_event_start(wait_event_info);
+ 
+ 	/*
+@@ -120,7 +118,7 @@ pgstat_report_wait_start(uint32 wait_event_info)
+ static inline void
+ pgstat_report_wait_end(void)
+ {
+-	if (pgstat_wait_event_usage_depth > 0)
++	if (unlikely(pgstat_wait_event_usage_active))
+ 		pgstat_count_wait_event_end();
+ 
+ 	/* see pgstat_report_wait_start() */
+-- 
+2.52.0
+

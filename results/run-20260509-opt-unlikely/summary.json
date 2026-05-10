@@ -1,0 +1,114 @@
+{
+  "run": "run-20260509-opt-unlikely",
+  "timestamp": "2026-05-08T21:59:50.476Z",
+  "build": "PostgreSQL 19devel, Apple clang 17, optimized default -O2, no --enable-debug, no --enable-cassert, --without-icu, jit=off, track_io_timing=off.",
+  "caveats": [
+    "Build is optimized default -O2 without --enable-cassert/--enable-debug.",
+    "SQL pg_sleep(0) does not produce useful wait-event signal; C extension microbench is the relevant hot-path result.",
+    "Runs were sequential on one local macOS machine; results are directional."
+  ],
+  "rows": [
+    {
+      "label": "SQL simple select, WAITS disabled",
+      "bench": "simple_select_disabled",
+      "loops": null,
+      "master_median_ms": null,
+      "patch_median_ms": null,
+      "delta_ms": null,
+      "delta_ns_per_wait": null,
+      "pct": null
+    },
+    {
+      "label": "SQL pg_sleep(0), WAITS disabled (not useful wait signal)",
+      "bench": "wait_loop_disabled_10k",
+      "loops": 10000,
+      "master_median_ms": null,
+      "patch_median_ms": null,
+      "delta_ms": null,
+      "delta_ns_per_wait": null,
+      "pct": null
+    },
+    {
+      "label": "SQL EXPLAIN ANALYZE no WAITS, pg_sleep(0)",
+      "bench": "explain_analyze_no_waits_sleep_10k",
+      "loops": 10000,
+      "master_median_ms": null,
+      "patch_median_ms": null,
+      "delta_ms": null,
+      "delta_ns_per_wait": null,
+      "pct": null
+    },
+    {
+      "label": "C wait loop, WAITS disabled",
+      "bench": "c_wait_loop_disabled_50m",
+      "loops": 50000000,
+      "master_times_ms": [
+        25.909,
+        21.647,
+        17.549,
+        17.927,
+        14.39
+      ],
+      "patch_times_ms": [
+        37.281,
+        26.348,
+        24.473,
+        25.174,
+        24.903
+      ],
+      "master_median_ms": 17.927,
+      "patch_median_ms": 25.174,
+      "delta_ms": 7.247,
+      "delta_ns_per_wait": 0.14494,
+      "pct": 40.42505717632621
+    },
+    {
+      "label": "C wait loop, EXPLAIN ANALYZE no WAITS",
+      "bench": "c_wait_loop_explain_no_waits_50m",
+      "loops": 50000000,
+      "master_times_ms": [
+        20.146,
+        20.97,
+        21.484,
+        20.079,
+        20.059
+      ],
+      "patch_times_ms": [
+        24.994,
+        24.712,
+        24.406,
+        24.537,
+        24.046
+      ],
+      "master_median_ms": 20.146,
+      "patch_median_ms": 24.537,
+      "delta_ms": 4.390999999999998,
+      "delta_ns_per_wait": 0.08781999999999997,
+      "pct": 21.79589000297825
+    },
+    {
+      "label": "C wait loop, EXPLAIN ANALYZE WAITS",
+      "bench": "c_wait_loop_explain_waits_10m",
+      "loops": 10000000,
+      "master_times_ms": null,
+      "patch_times_ms": [
+        319.279,
+        305.757,
+        304.656,
+        304.017,
+        303.828
+      ],
+      "master_median_ms": null,
+      "patch_median_ms": 304.656,
+      "delta_ms": null,
+      "delta_ns_per_wait": null,
+      "pct": null
+    }
+  ],
+  "enabled_waits_estimate": {
+    "patch_explain_no_waits_10m_equivalent_median_ms": 4.9074,
+    "patch_explain_waits_10m_median_ms": 304.656,
+    "delta_ms": 299.7486,
+    "ns_per_wait": 29.97486
+  }
+}

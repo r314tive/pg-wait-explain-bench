@@ -1,0 +1,157 @@
+From 5134e5cba2b025facd96b0c1568592749b31d30c Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 02:33:44 +0500
+Subject: [RFC PATCH v0 16/22] Avoid allocation while ending EXPLAIN WAITS
+
+---
+ doc/src/sgml/ref/explain.sgml           | 15 +++---
+ src/backend/utils/activity/wait_event.c | 71 ++++++-------------------
+ src/include/utils/wait_event.h          |  1 -
+ 3 files changed, 24 insertions(+), 63 deletions(-)
+
+diff --git a/doc/src/sgml/ref/explain.sgml b/doc/src/sgml/ref/explain.sgml
+index d699b215120..7fa4b1cd955 100644
+--- a/doc/src/sgml/ref/explain.sgml
++++ b/doc/src/sgml/ref/explain.sgml
+@@ -326,13 +326,14 @@ ROLLBACK;
+      </para>
+ 
+      <para>
+-      If <command>EXPLAIN</command> cannot grow its per-query or per-node wait
+-      event storage without risking an error while a wait is ending, waits
+-      whose exact event identifier could not be stored are accumulated in an
+-      <literal>Unrecorded Wait Event Calls</literal> counter and
+-      <literal>Unrecorded Wait Event Time</literal> total.  This is a
+-      reporting fallback under memory pressure, not a wait event emitted by
+-      server instrumentation.
++      Each statement and plan-node accumulator preallocates storage for up to
++      <literal>64</literal> distinct wait event identifiers.  This bound
++      avoids memory allocation while a wait is ending.  If more distinct wait
++      event identifiers are observed, waits whose exact event identifier could
++      not be stored are accumulated in an <literal>Unrecorded Wait Event
++      Calls</literal> counter and <literal>Unrecorded Wait Event Time</literal>
++      total.  This is a reporting fallback, not a wait event emitted by server
++      instrumentation.
+      </para>
+ 
+      <para>
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 61b418e8fd7..e423e92c4d7 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -27,7 +27,6 @@
+ #include "storage/shmem.h"
+ #include "storage/subsystems.h"
+ #include "storage/spin.h"
+-#include "utils/memutils.h"
+ #include "utils/wait_event.h"
+ 
+ 
+@@ -48,7 +47,13 @@ static int	WaitEventUsageFind(const WaitEventUsage *usage,
+ static uint32 local_my_wait_event_info;
+ uint32	   *my_wait_event_info = &local_my_wait_event_info;
+ 
+-#define WAIT_EVENT_USAGE_INITIAL_EVENTS	16
++/*
++ * Hardcoded limit: each EXPLAIN WAITS statement-level or plan-node accumulator
++ * can record this many distinct wait event identities without allocating while
++ * waits are ending.  Additional distinct wait identities are accounted for in
++ * the overflow bucket.
++ */
++#define WAIT_EVENT_USAGE_MAX_EVENTS		64
+ 
+ int			pgstat_wait_event_usage_depth = 0;
+ static WaitEventUsage *pgstat_wait_event_usage = NULL;
+@@ -384,15 +389,10 @@ pgstat_init_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 
+ 	memset(usage, 0, sizeof(WaitEventUsage));
+ 
+-	/*
+-	 * Wait events may end inside critical sections, for example while
+-	 * performing synchronous I/O.  Keep usage entries in a dedicated context
+-	 * where the memory manager permits that accounting path to grow.
+-	 */
+-	usage->memcontext = AllocSetContextCreate(memcontext,
+-											  "Wait Event Usage",
+-											  ALLOCSET_SMALL_SIZES);
+-	MemoryContextAllowInCriticalSection(usage->memcontext, true);
++	usage->entries = MemoryContextAlloc(memcontext,
++										sizeof(WaitEventUsageEntry) *
++										WAIT_EVENT_USAGE_MAX_EVENTS);
++	usage->maxentries = WAIT_EVENT_USAGE_MAX_EVENTS;
+ }
+ 
+ /*
+@@ -602,52 +602,13 @@ WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
+ 	{
+ 		if (usage->nentries >= usage->maxentries)
+ 		{
+-			int			newmaxentries;
+-			Size		entries_size;
+-			WaitEventUsageEntry *newentries;
+-
+-			if (usage->maxentries > 0)
+-			{
+-				if ((Size) usage->maxentries >
+-					MaxAllocSize / sizeof(WaitEventUsageEntry) / 2)
+-				{
+-					WaitEventUsageAddOverflow(usage, calls, elapsed);
+-					return;
+-				}
+-
+-				newmaxentries = usage->maxentries * 2;
+-			}
+-			else
+-				newmaxentries = WAIT_EVENT_USAGE_INITIAL_EVENTS;
+-
+-			if ((Size) newmaxentries >
+-				MaxAllocSize / sizeof(WaitEventUsageEntry))
+-			{
+-				WaitEventUsageAddOverflow(usage, calls, elapsed);
+-				return;
+-			}
+-
+-			entries_size = sizeof(WaitEventUsageEntry) * newmaxentries;
+ 			/*
+-			 * Wait completion can happen in a critical section, so growth
+-			 * must not throw ERROR.  If storage cannot be grown without
+-			 * throwing, preserve total wait time in the overflow bucket.
++			 * Wait-end accounting must not allocate: it can run in a critical
++			 * section.  Preserve total calls/time without the exact event
++			 * identity once preallocated storage is full.
+ 			 */
+-			if (usage->entries)
+-				newentries = repalloc_extended(usage->entries, entries_size,
+-											   MCXT_ALLOC_NO_OOM);
+-			else
+-				newentries = MemoryContextAllocExtended(usage->memcontext,
+-														entries_size,
+-														MCXT_ALLOC_NO_OOM);
+-			if (newentries == NULL)
+-			{
+-				WaitEventUsageAddOverflow(usage, calls, elapsed);
+-				return;
+-			}
+-
+-			usage->entries = newentries;
+-			usage->maxentries = newmaxentries;
++			WaitEventUsageAddOverflow(usage, calls, elapsed);
++			return;
+ 		}
+ 
+ 		if (idx < usage->nentries)
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index f14945cdb16..3037ed346a2 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -24,7 +24,6 @@ typedef struct WaitEventUsageEntry
+ 
+ typedef struct WaitEventUsage
+ {
+-	MemoryContext memcontext;
+ 	struct WaitEventUsage *active_parent; /* active plan-node stack link */
+ 	struct WaitEventUsage *query_parent;	/* active query-level stack link */
+ 	struct WaitEventUsage *saved_node_usage;	/* node stack at query start */
+-- 
+2.52.0
+

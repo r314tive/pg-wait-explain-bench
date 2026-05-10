@@ -1,0 +1,47 @@
+From 5aaedc2bc5e8f21bdffe9a71077b057c8732e075 Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Thu, 7 May 2026 09:27:26 +0500
+Subject: [RFC PATCH v0 06/22] Document EXPLAIN WAITS bitmap test scaffolding
+
+---
+ src/test/regress/expected/explain.out | 6 ++++++
+ src/test/regress/sql/explain.sql      | 6 ++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index 49b38e01e8e..c086fa48d80 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -151,6 +151,12 @@ select jsonb_path_query_first(
+ 
+ rollback;
+ begin;
++-- This test deliberately creates a Bitmap Index Scan runtime-key wait.
++-- The STABLE PL/pgSQL wrapper is test scaffolding: STABLE lets the
++-- expression be used as an index runtime key, while PL/pgSQL prevents SQL
++-- inlining from moving pg_sleep() out of the Bitmap Index Scan boundary.
++-- The planner GUCs below are likewise test-only scaffolding to make the
++-- node shape deterministic.
+ create function pg_temp.explain_waits_sleep_int(int) returns int
+   language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
+ create temp table explain_waits_bitmap (a int);
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index 655f74a3e78..bd196f248db 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -91,6 +91,12 @@ select jsonb_path_query_first(
+ );
+ rollback;
+ begin;
++-- This test deliberately creates a Bitmap Index Scan runtime-key wait.
++-- The STABLE PL/pgSQL wrapper is test scaffolding: STABLE lets the
++-- expression be used as an index runtime key, while PL/pgSQL prevents SQL
++-- inlining from moving pg_sleep() out of the Bitmap Index Scan boundary.
++-- The planner GUCs below are likewise test-only scaffolding to make the
++-- node shape deterministic.
+ create function pg_temp.explain_waits_sleep_int(int) returns int
+   language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
+ create temp table explain_waits_bitmap (a int);
+-- 
+2.52.0
+

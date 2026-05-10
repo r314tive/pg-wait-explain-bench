@@ -1,0 +1,40 @@
+# EXPLAIN WAITS microbench run-20260509-opt-unlikely
+
+Date: 2026-05-08T21:59:50.476Z
+
+Build: PostgreSQL 19devel, Apple clang 17, optimized default -O2, no --enable-debug, no --enable-cassert, --without-icu, jit=off, track_io_timing=off.
+
+Artifacts: raw psql output and scripts are under `/private/tmp/pg-wait-explain-bench`.
+
+## Caveats
+
+- Build is optimized default -O2 without --enable-cassert/--enable-debug.
+- SQL pg_sleep(0) does not produce useful wait-event signal; C extension microbench is the relevant hot-path result.
+- Runs were sequential on one local macOS machine; results are directional.
+
+## Medians
+
+| Benchmark | Master median ms | Patch median ms | Delta ms | Delta ns/wait | Delta % |
+|---|---:|---:|---:|---:|---:|
+| SQL simple select, WAITS disabled |  |  |  |  |  |
+| SQL pg_sleep(0), WAITS disabled (not useful wait signal) |  |  |  |  |  |
+| SQL EXPLAIN ANALYZE no WAITS, pg_sleep(0) |  |  |  |  |  |
+| C wait loop, WAITS disabled | 17.927 | 25.174 | 7.247 | 0.145 | 40.4 |
+| C wait loop, EXPLAIN ANALYZE no WAITS | 20.146 | 24.537 | 4.391 | 0.088 | 21.8 |
+| C wait loop, EXPLAIN ANALYZE WAITS |  | 304.656 |  |  |  |
+
+## Enabled WAITS estimate
+
+Patch `EXPLAIN ANALYZE, WAITS` for 10M synthetic wait start/end pairs: 304.656 ms median.
+Patch `EXPLAIN ANALYZE` no-WAITS normalized to 10M pairs: 4.907 ms median.
+Estimated incremental enabled accounting cost: 299.749 ms total, 29.975 ns/wait.
+
+## Raw Times
+
+- SQL simple select, WAITS disabled: master=[], patch=[]
+- SQL pg_sleep(0), WAITS disabled (not useful wait signal): master=[], patch=[]
+- SQL EXPLAIN ANALYZE no WAITS, pg_sleep(0): master=[], patch=[]
+- C wait loop, WAITS disabled: master=[25.909, 21.647, 17.549, 17.927, 14.39], patch=[37.281, 26.348, 24.473, 25.174, 24.903]
+- C wait loop, EXPLAIN ANALYZE no WAITS: master=[20.146, 20.97, 21.484, 20.079, 20.059], patch=[24.994, 24.712, 24.406, 24.537, 24.046]
+- C wait loop, EXPLAIN ANALYZE WAITS: master=[], patch=[319.279, 305.757, 304.656, 304.017, 303.828]
+

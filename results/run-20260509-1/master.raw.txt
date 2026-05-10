@@ -1,0 +1,144 @@
+Pager usage is off.
+Timing is on.
+                                                       version                                                       
+---------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 19devel on aarch64-apple-darwin25.4.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit
+(1 row)
+
+Time: 3.552 ms
+ server_version 
+----------------
+ 19devel
+(1 row)
+
+Time: 0.086 ms
+ jit 
+-----
+ off
+(1 row)
+
+Time: 0.043 ms
+ track_io_timing 
+-----------------
+ off
+(1 row)
+
+Time: 0.038 ms
+DROP TABLE
+Time: 0.837 ms
+SELECT 100000
+Time: 53.465 ms
+CREATE INDEX
+Time: 17.018 ms
+ANALYZE
+Time: 18.513 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 8.556 ms
+ count 
+-------
+  1000
+(1 row)
+
+Time: 0.606 ms
+BENCH simple_select_disabled
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 4.751 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 4.174 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 3.955 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 3.692 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 3.681 ms
+BENCH wait_loop_disabled_10k
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.519 ms
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.472 ms
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.463 ms
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.475 ms
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.628 ms
+BENCH explain_analyze_no_waits_sleep_10k
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.739 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.595 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.464 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.479 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.555 ms

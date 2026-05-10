@@ -1,0 +1,141 @@
+Pager usage is off.
+Timing is on.
+CREATE FUNCTION
+Time: 381.179 ms
+                                                       version                                                       
+---------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 19devel on aarch64-apple-darwin25.4.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit
+(1 row)
+
+Time: 0.400 ms
+ jit 
+-----
+ off
+(1 row)
+
+Time: 0.116 ms
+ track_io_timing 
+-----------------
+ off
+(1 row)
+
+Time: 0.054 ms
+ bench_wait_loop 
+-----------------
+          100000
+(1 row)
+
+Time: 0.239 ms
+BENCH c_wait_loop_disabled_5m
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 5.111 ms
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 4.518 ms
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 5.228 ms
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 4.051 ms
+ bench_wait_loop 
+-----------------
+         5000000
+(1 row)
+
+Time: 4.386 ms
+BENCH c_wait_loop_explain_no_waits_5m
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.804 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.792 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.477 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.703 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 3.170 ms
+BENCH c_wait_loop_explain_waits_5m
+                    QUERY PLAN                    
+--------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=5000000 time=72.154 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=5000000 time=72.154 ms
+(5 rows)
+
+Time: 163.508 ms
+                    QUERY PLAN                    
+--------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=5000000 time=70.226 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=5000000 time=70.226 ms
+(5 rows)
+
+Time: 159.211 ms
+                    QUERY PLAN                    
+--------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=5000000 time=70.537 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=5000000 time=70.537 ms
+(5 rows)
+
+Time: 159.640 ms
+                    QUERY PLAN                    
+--------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=5000000 time=71.062 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=5000000 time=71.062 ms
+(5 rows)
+
+Time: 161.090 ms
+                    QUERY PLAN                    
+--------------------------------------------------
+ Result (actual rows=1.00 loops=1)
+   Wait Events:
+     Timeout:PgSleep calls=5000000 time=76.944 ms
+ Statement Wait Events:
+   Timeout:PgSleep calls=5000000 time=76.944 ms
+(5 rows)
+
+Time: 174.470 ms

@@ -1,0 +1,216 @@
+Pager usage is off.
+Timing is on.
+                                                       version                                                       
+---------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 19devel on aarch64-apple-darwin25.4.0, compiled by Apple clang version 17.0.0 (clang-1700.6.3.2), 64-bit
+(1 row)
+
+Time: 3.509 ms
+ server_version 
+----------------
+ 19devel
+(1 row)
+
+Time: 0.072 ms
+ jit 
+-----
+ off
+(1 row)
+
+Time: 0.029 ms
+ track_io_timing 
+-----------------
+ off
+(1 row)
+
+Time: 0.027 ms
+DROP TABLE
+Time: 1.082 ms
+SELECT 100000
+Time: 63.297 ms
+CREATE INDEX
+Time: 17.677 ms
+ANALYZE
+Time: 16.538 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 9.356 ms
+ count 
+-------
+  1000
+(1 row)
+
+Time: 0.338 ms
+BENCH simple_select_disabled
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 3.964 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 3.877 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 3.664 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 3.705 ms
+ count  
+--------
+ 100000
+(1 row)
+
+Time: 3.698 ms
+BENCH wait_loop_disabled_10k
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.542 ms
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.423 ms
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.436 ms
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.444 ms
+ count 
+-------
+ 10000
+(1 row)
+
+Time: 0.429 ms
+BENCH explain_analyze_no_waits_sleep_10k
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.532 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.498 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.534 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.500 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.612 ms
+BENCH explain_analyze_waits_sleep_10k
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.531 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.669 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.498 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.483 ms
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series (actual rows=10000.00 loops=1)
+(2 rows)
+
+Time: 0.489 ms
+BENCH explain_analyze_waits_deep_join_1k
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series a (actual rows=1000.00 loops=1)
+(2 rows)
+
+Time: 0.133 ms
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series a (actual rows=1000.00 loops=1)
+(2 rows)
+
+Time: 0.111 ms
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series a (actual rows=1000.00 loops=1)
+(2 rows)
+
+Time: 0.097 ms
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series a (actual rows=1000.00 loops=1)
+(2 rows)
+
+Time: 0.094 ms
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Function Scan on generate_series a (actual rows=1000.00 loops=1)
+(2 rows)
+
+Time: 0.098 ms

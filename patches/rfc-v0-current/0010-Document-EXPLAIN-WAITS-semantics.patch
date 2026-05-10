@@ -1,0 +1,81 @@
+From 6feb3f402c4190bc1b4e2c6e6faf21ef6b8ce131 Mon Sep 17 00:00:00 2001
+From: Ilmar Iunusov <ilmar.iunusov@altenar.com>
+Date: Sat, 9 May 2026 01:26:58 +0500
+Subject: [RFC PATCH v0 10/22] Document EXPLAIN WAITS semantics
+
+---
+ doc/pg_wait_explain_diary.md  |  9 +++++++++
+ doc/src/sgml/ref/explain.sgml | 33 ++++++++++++++++++++++++++++++---
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/doc/pg_wait_explain_diary.md b/doc/pg_wait_explain_diary.md
+index 366acfd3c00..ffbab6bfb97 100644
+--- a/doc/pg_wait_explain_diary.md
++++ b/doc/pg_wait_explain_diary.md
+@@ -73,3 +73,12 @@ event requires insertion and possible array growth.  This avoids a linear scan
+ on the hot wait-end path without introducing a hash table into code that can
+ run inside critical sections.  The remaining insertion cost is proportional to
+ the number of distinct wait events already seen by that query or plan node.
++
++### User-facing documentation
++
++The `EXPLAIN` reference documentation promises three key semantics for
++`WAITS`: the top-level wait summary is the non-duplicated statement total,
++parallel worker waits are included in that total, and per-node wait events are
++inclusive like `EXPLAIN ANALYZE` node timing.  It also documents that wait
++timing is collected even with `TIMING OFF`, because `TIMING` controls plan-node
++execution timing rather than wait-event interval accounting.
+diff --git a/doc/src/sgml/ref/explain.sgml b/doc/src/sgml/ref/explain.sgml
+index 5460568af1d..fa16cd7d331 100644
+--- a/doc/src/sgml/ref/explain.sgml
++++ b/doc/src/sgml/ref/explain.sgml
+@@ -315,9 +315,27 @@ ROLLBACK;
+     <term><literal>WAITS</literal></term>
+     <listitem>
+      <para>
+-      Include exact backend-local wait event timing observed during query
+-      execution.  Wait events are grouped by wait event type and wait event
+-      name, and include the number of waits and total time spent waiting.
++      Include wait event timing observed during query execution.  Wait
++      events are grouped by wait event type and wait event name, using the
++      same wait event identifiers reported by
++      <structname>pg_stat_activity</structname>; see
++      <xref linkend="wait-event-table"/>.  Each entry includes the number
++      of completed waits and the total time spent waiting.  Wait timing is
++      collected when this option is enabled even if <literal>TIMING</literal>
++      is disabled.
++     </para>
++
++     <para>
++      The top-level <literal>Wait Events</literal> summary counts each wait
++      once for the statement, including waits reported by parallel workers.
++      Plan nodes can also show <literal>Wait Events</literal>.  Node-level
++      wait events are inclusive, like plan node timing in
++      <command>EXPLAIN ANALYZE</command>: a wait is attributed to every
++      active plan node when the wait begins.  Therefore node-level wait event
++      times should not be summed to compute the statement total.
++     </para>
++
++     <para>
+       This parameter may only be used when <literal>ANALYZE</literal> is also
+       enabled.  It defaults to <literal>FALSE</literal>.
+      </para>
+@@ -405,6 +423,15 @@ ROLLBACK;
+    execution, and on machines that have relatively slow operating
+    system calls for obtaining the time of day.
+   </para>
++
++  <para>
++   The <literal>WAITS</literal> option also adds profiling overhead when
++   <literal>ANALYZE</literal> is used.  It measures wait intervals reported
++   by server instrumentation and maintains per-statement and per-node wait
++   event counters while the statement executes.  The overhead depends on the
++   number of reported waits, the number of distinct wait events, and the depth
++   of the active executor plan node stack.
++  </para>
+  </refsect1>
+ 
+  <refsect1>
+-- 
+2.52.0
+

@@ -1,0 +1,72 @@
+Pager usage is off.
+Timing is on.
+CREATE FUNCTION
+Time: 5.965 ms
+ bench_wait_loop 
+-----------------
+         1000000
+(1 row)
+
+Time: 0.716 ms
+BENCH c_wait_loop_disabled_50m
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 17.187 ms
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 21.122 ms
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 21.189 ms
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 15.113 ms
+ bench_wait_loop 
+-----------------
+        50000000
+(1 row)
+
+Time: 16.412 ms
+BENCH c_wait_loop_explain_no_waits_50m
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 18.659 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 15.312 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 18.115 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 18.138 ms
+            QUERY PLAN             
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+Time: 21.589 ms
