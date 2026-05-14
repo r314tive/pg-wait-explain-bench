@@ -1,0 +1,933 @@
+From cb26aa486d42f227209c27df4aef4b07f13e334a Mon Sep 17 00:00:00 2001
+From: Ilmar Yunusov <tanswis42@gmail.com>
+Date: Sat, 9 May 2026 03:44:35 +0500
+Subject: [RFC PATCH v1 3/7] Attribute EXPLAIN WAITS to plan nodes
+
+---
+ src/backend/commands/explain.c             |   6 +-
+ src/backend/executor/execAsync.c           |  22 ++++
+ src/backend/executor/execParallel.c        | 131 ++++++++++++++++++---
+ src/backend/executor/execProcnode.c        |  31 ++++-
+ src/backend/executor/instrument.c          |   7 ++
+ src/backend/executor/nodeBitmapAnd.c       |   7 ++
+ src/backend/executor/nodeBitmapIndexscan.c |   7 ++
+ src/backend/executor/nodeBitmapOr.c        |   7 ++
+ src/backend/executor/nodeHash.c            |   7 ++
+ src/backend/utils/activity/wait_event.c    |  49 +++++++-
+ src/include/executor/instrument.h          |   1 +
+ src/include/nodes/execnodes.h              |   1 +
+ src/include/utils/wait_event.h             |   4 +
+ src/test/regress/expected/explain.out      |  52 +++++++-
+ src/test/regress/sql/explain.sql           |  29 +++++
+ 15 files changed, 333 insertions(+), 28 deletions(-)
+
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 9d7372f5415..0575ae8368b 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -530,6 +530,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ 		instrument_option |= INSTRUMENT_WAL;
+ 	if (es->io)
+ 		instrument_option |= INSTRUMENT_IO;
++	if (es->waits)
++		instrument_option |= INSTRUMENT_WAITS;
+ 
+ 	/*
+ 	 * We always collect timing for the entire statement, even when node-level
+@@ -2332,6 +2334,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
+ 		show_buffer_usage(es, &planstate->instrument->instr.bufusage);
+ 	if (es->wal && planstate->instrument)
+ 		show_wal_usage(es, &planstate->instrument->instr.walusage);
++	if (es->waits)
++		show_wait_event_usage(es, planstate->wait_event_usage);
+ 
+ 	/* Prepare per-worker buffer/WAL usage */
+ 	if (es->workers_state && (es->buffers || es->wal) && es->verbose)
+@@ -4559,7 +4563,7 @@ show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
+ 	if (usage == NULL)
+ 		return;
+ 
+-	if (es->format == EXPLAIN_FORMAT_TEXT && usage->nentries == 0)
++	if (usage->nentries == 0)
+ 		return;
+ 
+ 	if (usage->nentries > 0)
+diff --git a/src/backend/executor/execAsync.c b/src/backend/executor/execAsync.c
+index cf7ddbb01f4..e73ea55cf92 100644
+--- a/src/backend/executor/execAsync.c
++++ b/src/backend/executor/execAsync.c
+@@ -19,6 +19,7 @@
+ #include "executor/instrument.h"
+ #include "executor/nodeAppend.h"
+ #include "executor/nodeForeignscan.h"
++#include "utils/wait_event.h"
+ 
+ /*
+  * Asynchronously request a tuple from a designed async-capable node.
+@@ -26,12 +27,17 @@
+ void
+ ExecAsyncRequest(AsyncRequest *areq)
+ {
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	if (areq->requestee->chgParam != NULL)	/* something changed? */
+ 		ExecReScan(areq->requestee);	/* let ReScan handle this */
+ 
+ 	/* must provide our own instrumentation support */
+ 	if (areq->requestee->instrument)
+ 		InstrStartNode(areq->requestee->instrument);
++	if (areq->requestee->wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(areq->requestee->wait_event_usage);
+ 
+ 	switch (nodeTag(areq->requestee))
+ 	{
+@@ -47,6 +53,8 @@ ExecAsyncRequest(AsyncRequest *areq)
+ 	ExecAsyncResponse(areq);
+ 
+ 	/* must provide our own instrumentation support */
++	if (areq->requestee->wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (areq->requestee->instrument)
+ 		InstrStopNode(areq->requestee->instrument,
+ 					  TupIsNull(areq->result) ? 0.0 : 1.0);
+@@ -62,9 +70,14 @@ ExecAsyncRequest(AsyncRequest *areq)
+ void
+ ExecAsyncConfigureWait(AsyncRequest *areq)
+ {
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	/* must provide our own instrumentation support */
+ 	if (areq->requestee->instrument)
+ 		InstrStartNode(areq->requestee->instrument);
++	if (areq->requestee->wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(areq->requestee->wait_event_usage);
+ 
+ 	switch (nodeTag(areq->requestee))
+ 	{
+@@ -78,6 +91,8 @@ ExecAsyncConfigureWait(AsyncRequest *areq)
+ 	}
+ 
+ 	/* must provide our own instrumentation support */
++	if (areq->requestee->wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (areq->requestee->instrument)
+ 		InstrStopNode(areq->requestee->instrument, 0.0);
+ }
+@@ -88,9 +103,14 @@ ExecAsyncConfigureWait(AsyncRequest *areq)
+ void
+ ExecAsyncNotify(AsyncRequest *areq)
+ {
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	/* must provide our own instrumentation support */
+ 	if (areq->requestee->instrument)
+ 		InstrStartNode(areq->requestee->instrument);
++	if (areq->requestee->wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(areq->requestee->wait_event_usage);
+ 
+ 	switch (nodeTag(areq->requestee))
+ 	{
+@@ -106,6 +126,8 @@ ExecAsyncNotify(AsyncRequest *areq)
+ 	ExecAsyncResponse(areq);
+ 
+ 	/* must provide our own instrumentation support */
++	if (areq->requestee->wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (areq->requestee->instrument)
+ 		InstrStopNode(areq->requestee->instrument,
+ 					  TupIsNull(areq->result) ? 0.0 : 1.0);
+diff --git a/src/backend/executor/execParallel.c b/src/backend/executor/execParallel.c
+index 8213565a708..f77f539dd27 100644
+--- a/src/backend/executor/execParallel.c
++++ b/src/backend/executor/execParallel.c
+@@ -83,6 +83,12 @@ typedef struct FixedParallelExecutorState
+ 	int			jit_flags;
+ } FixedParallelExecutorState;
+ 
++typedef struct SharedWaitEventUsageWorker
++{
++	int			nentries;
++	dsa_pointer entries;
++} SharedWaitEventUsageWorker;
++
+ /*
+  * DSM structure for accumulating per-PlanState instrumentation.
+  *
+@@ -92,6 +98,10 @@ typedef struct FixedParallelExecutorState
+  * of the first NodeInstrumentation object.  This will depend on the length of
+  * the plan_node_id array.
+  *
++ * wait_event_usage_offset: Offset, relative to the start of this structure,
++ * of the first SharedWaitEventUsageWorker object, or 0 if wait event usage is
++ * not being collected.
++ *
+  * num_workers: Number of workers.
+  *
+  * num_plan_nodes: Number of plan nodes.
+@@ -103,6 +113,7 @@ struct SharedExecutorInstrumentation
+ {
+ 	int			instrument_options;
+ 	int			instrument_offset;
++	int			wait_event_usage_offset;
+ 	int			num_workers;
+ 	int			num_plan_nodes;
+ 	int			plan_node_id[FLEXIBLE_ARRAY_MEMBER];
+@@ -110,17 +121,17 @@ struct SharedExecutorInstrumentation
+ 	/*
+ 	 * Array of num_plan_nodes * num_workers NodeInstrumentation objects
+ 	 * follows.
++	 *
++	 * If wait_event_usage_offset is non-zero, an array of num_plan_nodes *
++	 * num_workers SharedWaitEventUsageWorker objects follows.
+ 	 */
+ };
+ #define GetInstrumentationArray(sei) \
+ 	(StaticAssertVariableIsOfTypeMacro(sei, SharedExecutorInstrumentation *), \
+ 	 (NodeInstrumentation *) (((char *) sei) + sei->instrument_offset))
+-
+-typedef struct SharedWaitEventUsageWorker
+-{
+-	int			nentries;
+-	dsa_pointer entries;
+-} SharedWaitEventUsageWorker;
++#define GetInstrumentationWaitEventUsageArray(sei) \
++	(StaticAssertVariableIsOfTypeMacro(sei, SharedExecutorInstrumentation *), \
++	 (SharedWaitEventUsageWorker *) (((char *) sei) + sei->wait_event_usage_offset))
+ 
+ struct SharedWaitEventUsage
+ {
+@@ -143,6 +154,12 @@ typedef struct ExecParallelInitializeDSMContext
+ 	int			nnodes;
+ } ExecParallelInitializeDSMContext;
+ 
++typedef struct ExecParallelRetrieveInstrumentationContext
++{
++	SharedExecutorInstrumentation *instrumentation;
++	dsa_area   *area;
++} ExecParallelRetrieveInstrumentationContext;
++
+ /* Helper functions that run in the parallel leader. */
+ static char *ExecSerializePlan(Plan *plan, EState *estate);
+ static bool ExecParallelEstimate(PlanState *planstate,
+@@ -154,8 +171,11 @@ static shm_mq_handle **ExecParallelSetupTupleQueues(ParallelContext *pcxt,
+ static bool ExecParallelReInitializeDSM(PlanState *planstate,
+ 										ParallelContext *pcxt);
+ static bool ExecParallelRetrieveInstrumentation(PlanState *planstate,
+-												SharedExecutorInstrumentation *instrumentation);
++												ExecParallelRetrieveInstrumentationContext *r);
+ static void ExecParallelRetrieveWaitEventUsage(ParallelExecutorInfo *pei);
++static void ExecParallelReportWaitEventUsageWorker(SharedWaitEventUsageWorker *worker,
++												   dsa_area *area,
++												   const WaitEventUsage *usage);
+ static void ExecParallelReportWaitEventUsage(SharedWaitEventUsage *shared,
+ 											 dsa_area *area,
+ 											 const WaitEventUsage *usage);
+@@ -691,6 +711,7 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate,
+ 	int			instrumentation_len = 0;
+ 	int			jit_instrumentation_len = 0;
+ 	int			instrument_offset = 0;
++	int			wait_event_usage_offset = 0;
+ 	Size		dsa_minsize = dsa_minimum_size();
+ 	char	   *query_string;
+ 	int			query_len;
+@@ -798,6 +819,14 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate,
+ 		instrumentation_len +=
+ 			mul_size(sizeof(NodeInstrumentation),
+ 					 mul_size(e.nnodes, nworkers));
++		if (estate->es_instrument & INSTRUMENT_WAITS)
++		{
++			instrumentation_len = MAXALIGN(instrumentation_len);
++			wait_event_usage_offset = instrumentation_len;
++			instrumentation_len +=
++				mul_size(sizeof(SharedWaitEventUsageWorker),
++						 mul_size(e.nnodes, nworkers));
++		}
+ 		shm_toc_estimate_chunk(&pcxt->estimator, instrumentation_len);
+ 		shm_toc_estimate_keys(&pcxt->estimator, 1);
+ 
+@@ -903,11 +932,23 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate,
+ 		instrumentation = shm_toc_allocate(pcxt->toc, instrumentation_len);
+ 		instrumentation->instrument_options = estate->es_instrument;
+ 		instrumentation->instrument_offset = instrument_offset;
++		instrumentation->wait_event_usage_offset = wait_event_usage_offset;
+ 		instrumentation->num_workers = nworkers;
+ 		instrumentation->num_plan_nodes = e.nnodes;
+ 		instrument = GetInstrumentationArray(instrumentation);
+ 		for (i = 0; i < nworkers * e.nnodes; ++i)
+ 			InstrInitNode(&instrument[i], estate->es_instrument, false);
++		if (wait_event_usage_offset != 0)
++		{
++			SharedWaitEventUsageWorker *worker_usage;
++
++			worker_usage = GetInstrumentationWaitEventUsageArray(instrumentation);
++			for (i = 0; i < nworkers * e.nnodes; ++i)
++			{
++				worker_usage[i].nentries = 0;
++				worker_usage[i].entries = InvalidDsaPointer;
++			}
++		}
+ 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_INSTRUMENTATION,
+ 					   instrumentation);
+ 		pei->instrumentation = instrumentation;
+@@ -1137,9 +1178,11 @@ ExecParallelReInitializeDSM(PlanState *planstate,
+  */
+ static bool
+ ExecParallelRetrieveInstrumentation(PlanState *planstate,
+-									SharedExecutorInstrumentation *instrumentation)
++									ExecParallelRetrieveInstrumentationContext *r)
+ {
++	SharedExecutorInstrumentation *instrumentation = r->instrumentation;
+ 	NodeInstrumentation *instrument;
++	SharedWaitEventUsageWorker *wait_event_usage = NULL;
+ 	int			i;
+ 	int			n;
+ 	int			ibytes;
+@@ -1159,6 +1202,30 @@ ExecParallelRetrieveInstrumentation(PlanState *planstate,
+ 	for (n = 0; n < instrumentation->num_workers; ++n)
+ 		InstrAggNode(planstate->instrument, &instrument[n]);
+ 
++	/* Accumulate the wait event usage from all workers. */
++	if (instrumentation->wait_event_usage_offset != 0 &&
++		planstate->wait_event_usage != NULL)
++	{
++		wait_event_usage = GetInstrumentationWaitEventUsageArray(instrumentation);
++		wait_event_usage += i * instrumentation->num_workers;
++		for (n = 0; n < instrumentation->num_workers; ++n)
++		{
++			SharedWaitEventUsageWorker *worker = &wait_event_usage[n];
++			WaitEventUsageEntry *entries;
++
++			if (worker->nentries <= 0 || !DsaPointerIsValid(worker->entries))
++				continue;
++
++			entries = dsa_get_address(r->area, worker->entries);
++			pgstat_accumulate_wait_event_usage(planstate->wait_event_usage,
++											   entries,
++											   worker->nentries);
++			dsa_free(r->area, worker->entries);
++			worker->nentries = 0;
++			worker->entries = InvalidDsaPointer;
++		}
++	}
++
+ 	/*
+ 	 * Also store the per-worker detail.
+ 	 *
+@@ -1216,7 +1283,7 @@ ExecParallelRetrieveInstrumentation(PlanState *planstate,
+ 	}
+ 
+ 	return planstate_tree_walker(planstate, ExecParallelRetrieveInstrumentation,
+-								 instrumentation);
++								 r);
+ }
+ 
+ /*
+@@ -1290,25 +1357,21 @@ ExecParallelRetrieveWaitEventUsage(ParallelExecutorInfo *pei)
+ }
+ 
+ static void
+-ExecParallelReportWaitEventUsage(SharedWaitEventUsage *shared,
+-								 dsa_area *area,
+-								 const WaitEventUsage *usage)
++ExecParallelReportWaitEventUsageWorker(SharedWaitEventUsageWorker *worker,
++									   dsa_area *area,
++									   const WaitEventUsage *usage)
+ {
+-	SharedWaitEventUsageWorker *worker;
+ 	WaitEventUsageEntry *entries;
+ 	dsa_pointer entries_dsa;
+ 	Size		entries_size;
+ 
+-	Assert(shared != NULL);
++	Assert(worker != NULL);
+ 	Assert(area != NULL);
+ 	Assert(usage != NULL);
+-	Assert(IsParallelWorker());
+-	Assert(ParallelWorkerNumber < shared->num_workers);
+ 
+ 	if (usage->nentries <= 0)
+ 		return;
+ 
+-	worker = &shared->worker_usage[ParallelWorkerNumber];
+ 	entries_size = mul_size(sizeof(WaitEventUsageEntry), usage->nentries);
+ 	entries_dsa = dsa_allocate(area, entries_size);
+ 	entries = dsa_get_address(area, entries_dsa);
+@@ -1320,6 +1383,20 @@ ExecParallelReportWaitEventUsage(SharedWaitEventUsage *shared,
+ 	worker->entries = entries_dsa;
+ }
+ 
++static void
++ExecParallelReportWaitEventUsage(SharedWaitEventUsage *shared,
++								 dsa_area *area,
++								 const WaitEventUsage *usage)
++{
++	Assert(shared != NULL);
++	Assert(IsParallelWorker());
++	Assert(ParallelWorkerNumber < shared->num_workers);
++
++	ExecParallelReportWaitEventUsageWorker(&shared->worker_usage[ParallelWorkerNumber],
++										   area,
++										   usage);
++}
++
+ /*
+  * Finish parallel execution.  We wait for parallel workers to finish, and
+  * accumulate their buffer/WAL usage.
+@@ -1385,8 +1462,13 @@ ExecParallelCleanup(ParallelExecutorInfo *pei)
+ {
+ 	/* Accumulate instrumentation, if any. */
+ 	if (pei->instrumentation)
+-		ExecParallelRetrieveInstrumentation(pei->planstate,
+-											pei->instrumentation);
++	{
++		ExecParallelRetrieveInstrumentationContext r;
++
++		r.instrumentation = pei->instrumentation;
++		r.area = pei->area;
++		ExecParallelRetrieveInstrumentation(pei->planstate, &r);
++	}
+ 
+ 	/* Accumulate JIT instrumentation, if any. */
+ 	if (pei->jit_instrumentation)
+@@ -1495,6 +1577,17 @@ ExecParallelReportInstrumentation(PlanState *planstate,
+ 	Assert(IsParallelWorker());
+ 	Assert(ParallelWorkerNumber < instrumentation->num_workers);
+ 	InstrAggNode(&instrument[ParallelWorkerNumber], planstate->instrument);
++	if (instrumentation->wait_event_usage_offset != 0 &&
++		planstate->wait_event_usage != NULL)
++	{
++		SharedWaitEventUsageWorker *wait_event_usage;
++
++		wait_event_usage = GetInstrumentationWaitEventUsageArray(instrumentation);
++		wait_event_usage += i * instrumentation->num_workers;
++		ExecParallelReportWaitEventUsageWorker(&wait_event_usage[ParallelWorkerNumber],
++											   planstate->state->es_query_dsa,
++											   planstate->wait_event_usage);
++	}
+ 
+ 	return planstate_tree_walker(planstate, ExecParallelReportInstrumentation,
+ 								 instrumentation);
+diff --git a/src/backend/executor/execProcnode.c b/src/backend/executor/execProcnode.c
+index 7c4c66e323f..081855b3fed 100644
+--- a/src/backend/executor/execProcnode.c
++++ b/src/backend/executor/execProcnode.c
+@@ -118,6 +118,7 @@
+ #include "executor/nodeWindowAgg.h"
+ #include "executor/nodeWorktablescan.h"
+ #include "miscadmin.h"
++#include "utils/wait_event.h"
+ #include "nodes/nodeFuncs.h"
+ 
+ static TupleTableSlot *ExecProcNodeFirst(PlanState *node);
+@@ -415,6 +416,16 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
+ 	if (estate->es_instrument)
+ 		result->instrument = InstrAllocNode(estate->es_instrument,
+ 											result->async_capable);
++	if (estate->es_instrument & INSTRUMENT_WAITS)
++	{
++		MemoryContext oldcontext;
++
++		oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
++		result->wait_event_usage = palloc_object(WaitEventUsage);
++		pgstat_init_wait_event_usage(result->wait_event_usage,
++									 estate->es_query_cxt);
++		MemoryContextSwitchTo(oldcontext);
++	}
+ 
+ 	return result;
+ }
+@@ -481,7 +492,8 @@ ExecProcNodeFirst(PlanState *node)
+  * This has essentially the same responsibilities as ExecProcNode,
+  * but it does not do InstrStartNode/InstrStopNode (mainly because
+  * it can't tell how many returned tuples to count).  Each per-node
+- * function must provide its own instrumentation support.
++ * function must provide its own instrumentation support, including
++ * wait event attribution when enabled.
+  * ----------------------------------------------------------------
+  */
+ Node *
+@@ -758,6 +770,9 @@ ExecShutdownNode(PlanState *node)
+ static bool
+ ExecShutdownNode_walker(PlanState *node, void *context)
+ {
++	bool		node_running;
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	if (node == NULL)
+ 		return false;
+ 
+@@ -773,8 +788,14 @@ ExecShutdownNode_walker(PlanState *node, void *context)
+ 	 * has never been executed, so as to avoid incorrectly making it appear
+ 	 * that it has.
+ 	 */
+-	if (node->instrument && node->instrument->running)
++	node_running = node->instrument && node->instrument->running;
++	if (node_running)
++	{
+ 		InstrStartNode(node->instrument);
++		if (node->wait_event_usage)
++			previous_wait_event_usage =
++				pgstat_enter_wait_event_usage(node->wait_event_usage);
++	}
+ 
+ 	planstate_tree_walker(node, ExecShutdownNode_walker, context);
+ 
+@@ -803,8 +824,12 @@ ExecShutdownNode_walker(PlanState *node, void *context)
+ 	}
+ 
+ 	/* Stop the node if we started it above, reporting 0 tuples. */
+-	if (node->instrument && node->instrument->running)
++	if (node_running)
++	{
++		if (node->wait_event_usage)
++			pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 		InstrStopNode(node->instrument, 0);
++	}
+ 
+ 	return false;
+ }
+diff --git a/src/backend/executor/instrument.c b/src/backend/executor/instrument.c
+index ffbcd572133..a1f22180f82 100644
+--- a/src/backend/executor/instrument.c
++++ b/src/backend/executor/instrument.c
+@@ -21,6 +21,7 @@
+ #include "nodes/execnodes.h"
+ #include "portability/instr_time.h"
+ #include "utils/guc_hooks.h"
++#include "utils/wait_event.h"
+ 
+ BufferUsage pgBufferUsage;
+ static BufferUsage save_pgBufferUsage;
+@@ -181,11 +182,17 @@ TupleTableSlot *
+ ExecProcNodeInstr(PlanState *node)
+ {
+ 	TupleTableSlot *result;
++	WaitEventUsage *previous_wait_event_usage = NULL;
+ 
+ 	InstrStartNode(node->instrument);
++	if (node->wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->wait_event_usage);
+ 
+ 	result = node->ExecProcNodeReal(node);
+ 
++	if (node->wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
+ 
+ 	return result;
+diff --git a/src/backend/executor/nodeBitmapAnd.c b/src/backend/executor/nodeBitmapAnd.c
+index 9007dda3802..e2b442bd378 100644
+--- a/src/backend/executor/nodeBitmapAnd.c
++++ b/src/backend/executor/nodeBitmapAnd.c
+@@ -32,6 +32,7 @@
+ #include "executor/instrument.h"
+ #include "executor/nodeBitmapAnd.h"
+ #include "nodes/tidbitmap.h"
++#include "utils/wait_event.h"
+ 
+ 
+ /* ----------------------------------------------------------------
+@@ -115,10 +116,14 @@ MultiExecBitmapAnd(BitmapAndState *node)
+ 	int			nplans;
+ 	int			i;
+ 	TIDBitmap  *result = NULL;
++	WaitEventUsage *previous_wait_event_usage = NULL;
+ 
+ 	/* must provide our own instrumentation support */
+ 	if (node->ps.instrument)
+ 		InstrStartNode(node->ps.instrument);
++	if (node->ps.wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->ps.wait_event_usage);
+ 
+ 	/*
+ 	 * get information from the node
+@@ -162,6 +167,8 @@ MultiExecBitmapAnd(BitmapAndState *node)
+ 		elog(ERROR, "BitmapAnd doesn't support zero inputs");
+ 
+ 	/* must provide our own instrumentation support */
++	if (node->ps.wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (node->ps.instrument)
+ 		InstrStopNode(node->ps.instrument, 0 /* XXX */ );
+ 
+diff --git a/src/backend/executor/nodeBitmapIndexscan.c b/src/backend/executor/nodeBitmapIndexscan.c
+index 7978514e1bc..c2798a81e97 100644
+--- a/src/backend/executor/nodeBitmapIndexscan.c
++++ b/src/backend/executor/nodeBitmapIndexscan.c
+@@ -28,6 +28,7 @@
+ #include "executor/nodeIndexscan.h"
+ #include "miscadmin.h"
+ #include "nodes/tidbitmap.h"
++#include "utils/wait_event.h"
+ 
+ 
+ /* ----------------------------------------------------------------
+@@ -54,10 +55,14 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
+ 	IndexScanDesc scandesc;
+ 	double		nTuples = 0;
+ 	bool		doscan;
++	WaitEventUsage *previous_wait_event_usage = NULL;
+ 
+ 	/* must provide our own instrumentation support */
+ 	if (node->ss.ps.instrument)
+ 		InstrStartNode(node->ss.ps.instrument);
++	if (node->ss.ps.wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->ss.ps.wait_event_usage);
+ 
+ 	/*
+ 	 * extract necessary information from index scan node
+@@ -116,6 +121,8 @@ MultiExecBitmapIndexScan(BitmapIndexScanState *node)
+ 	}
+ 
+ 	/* must provide our own instrumentation support */
++	if (node->ss.ps.wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (node->ss.ps.instrument)
+ 		InstrStopNode(node->ss.ps.instrument, nTuples);
+ 
+diff --git a/src/backend/executor/nodeBitmapOr.c b/src/backend/executor/nodeBitmapOr.c
+index 148c80fdae6..e9ee934a6f6 100644
+--- a/src/backend/executor/nodeBitmapOr.c
++++ b/src/backend/executor/nodeBitmapOr.c
+@@ -33,6 +33,7 @@
+ #include "executor/nodeBitmapOr.h"
+ #include "nodes/tidbitmap.h"
+ #include "miscadmin.h"
++#include "utils/wait_event.h"
+ 
+ 
+ /* ----------------------------------------------------------------
+@@ -116,10 +117,14 @@ MultiExecBitmapOr(BitmapOrState *node)
+ 	int			nplans;
+ 	int			i;
+ 	TIDBitmap  *result = NULL;
++	WaitEventUsage *previous_wait_event_usage = NULL;
+ 
+ 	/* must provide our own instrumentation support */
+ 	if (node->ps.instrument)
+ 		InstrStartNode(node->ps.instrument);
++	if (node->ps.wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->ps.wait_event_usage);
+ 
+ 	/*
+ 	 * get information from the node
+@@ -180,6 +185,8 @@ MultiExecBitmapOr(BitmapOrState *node)
+ 		elog(ERROR, "BitmapOr doesn't support zero inputs");
+ 
+ 	/* must provide our own instrumentation support */
++	if (node->ps.wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (node->ps.instrument)
+ 		InstrStopNode(node->ps.instrument, 0 /* XXX */ );
+ 
+diff --git a/src/backend/executor/nodeHash.c b/src/backend/executor/nodeHash.c
+index 8825bb6fa23..6e9e4b4218f 100644
+--- a/src/backend/executor/nodeHash.c
++++ b/src/backend/executor/nodeHash.c
+@@ -105,9 +105,14 @@ ExecHash(PlanState *pstate)
+ Node *
+ MultiExecHash(HashState *node)
+ {
++	WaitEventUsage *previous_wait_event_usage = NULL;
++
+ 	/* must provide our own instrumentation support */
+ 	if (node->ps.instrument)
+ 		InstrStartNode(node->ps.instrument);
++	if (node->ps.wait_event_usage)
++		previous_wait_event_usage =
++			pgstat_enter_wait_event_usage(node->ps.wait_event_usage);
+ 
+ 	if (node->parallel_state != NULL)
+ 		MultiExecParallelHash(node);
+@@ -115,6 +120,8 @@ MultiExecHash(HashState *node)
+ 		MultiExecPrivateHash(node);
+ 
+ 	/* must provide our own instrumentation support */
++	if (node->ps.wait_event_usage)
++		pgstat_restore_wait_event_usage(previous_wait_event_usage);
+ 	if (node->ps.instrument)
+ 		InstrStopNode(node->ps.instrument, node->hashtable->reportTuples);
+ 
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index eb01bc3d88c..3d5a10b44c4 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -27,6 +27,7 @@
+ #include "storage/shmem.h"
+ #include "storage/subsystems.h"
+ #include "storage/spin.h"
++#include "utils/memutils.h"
+ #include "utils/wait_event.h"
+ 
+ 
+@@ -47,6 +48,7 @@ uint32	   *my_wait_event_info = &local_my_wait_event_info;
+ 
+ int			pgstat_wait_event_usage_depth = 0;
+ static WaitEventUsage *pgstat_wait_event_usage = NULL;
++static WaitEventUsage *pgstat_wait_event_node_usage = NULL;
+ static uint32 pgstat_wait_event_usage_current = 0;
+ static instr_time pgstat_wait_event_usage_start;
+ 
+@@ -358,6 +360,28 @@ pgstat_reset_wait_event_storage(void)
+ 	my_wait_event_info = &local_my_wait_event_info;
+ }
+ 
++/*
++ * Initialize a wait event usage accumulator.
++ */
++void
++pgstat_init_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
++{
++	Assert(usage != NULL);
++	Assert(memcontext != NULL);
++
++	memset(usage, 0, sizeof(WaitEventUsage));
++
++	/*
++	 * Wait events may end inside critical sections, for example while
++	 * performing synchronous I/O.  Keep usage entries in a dedicated context
++	 * where the memory manager permits that accounting path to grow.
++	 */
++	usage->memcontext = AllocSetContextCreate(memcontext,
++											  "Wait Event Usage",
++											  ALLOCSET_SMALL_SIZES);
++	MemoryContextAllowInCriticalSection(usage->memcontext, true);
++}
++
+ /*
+  * Start collecting exact wait event timings in this backend.
+  *
+@@ -375,9 +399,9 @@ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ 
+ 	if (pgstat_wait_event_usage_depth++ == 0)
+ 	{
+-		memset(usage, 0, sizeof(WaitEventUsage));
+-		usage->memcontext = memcontext;
++		pgstat_init_wait_event_usage(usage, memcontext);
+ 		pgstat_wait_event_usage = usage;
++		pgstat_wait_event_node_usage = NULL;
+ 		pgstat_wait_event_usage_current = 0;
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
+@@ -398,11 +422,27 @@ pgstat_end_wait_event_usage(WaitEventUsage *usage)
+ 			pgstat_count_wait_event_end();
+ 
+ 		pgstat_wait_event_usage = NULL;
++		pgstat_wait_event_node_usage = NULL;
+ 		pgstat_wait_event_usage_current = 0;
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
+ }
+ 
++WaitEventUsage *
++pgstat_enter_wait_event_usage(WaitEventUsage *usage)
++{
++	WaitEventUsage *previous = pgstat_wait_event_node_usage;
++
++	pgstat_wait_event_node_usage = usage;
++	return previous;
++}
++
++void
++pgstat_restore_wait_event_usage(WaitEventUsage *usage)
++{
++	pgstat_wait_event_node_usage = usage;
++}
++
+ /*
+  * Record the beginning of a wait event for exact EXPLAIN-style accounting.
+  */
+@@ -444,6 +484,11 @@ pgstat_count_wait_event_end(void)
+ 					  pgstat_wait_event_usage_current,
+ 					  1,
+ 					  &elapsed);
++	if (pgstat_wait_event_node_usage != NULL)
++		WaitEventUsageAdd(pgstat_wait_event_node_usage,
++						  pgstat_wait_event_usage_current,
++						  1,
++						  &elapsed);
+ 
+ 	pgstat_wait_event_usage_current = 0;
+ 	INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+diff --git a/src/include/executor/instrument.h b/src/include/executor/instrument.h
+index f093a52aae0..f46ee03d2c1 100644
+--- a/src/include/executor/instrument.h
++++ b/src/include/executor/instrument.h
+@@ -65,6 +65,7 @@ typedef enum InstrumentOption
+ 	INSTRUMENT_ROWS = 1 << 2,	/* needs row count */
+ 	INSTRUMENT_WAL = 1 << 3,	/* needs WAL usage */
+ 	INSTRUMENT_IO = 1 << 4,		/* needs IO usage */
++	INSTRUMENT_WAITS = 1 << 5,	/* needs wait event usage */
+ 	INSTRUMENT_ALL = PG_INT32_MAX
+ } InstrumentOption;
+ 
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index 781c8c79132..56f9dcbef88 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -1212,6 +1212,7 @@ typedef struct PlanState
+ 
+ 	NodeInstrumentation *instrument;	/* Optional runtime stats for this
+ 										 * node */
++	WaitEventUsage *wait_event_usage; /* Optional wait event usage */
+ 	WorkerNodeInstrumentation *worker_instrument;	/* per-worker
+ 													 * instrumentation */
+ 
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 63992137ee7..64411288403 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -36,12 +36,16 @@ static inline void pgstat_report_wait_start(uint32 wait_event_info);
+ static inline void pgstat_report_wait_end(void);
+ extern void pgstat_set_wait_event_storage(uint32 *wait_event_info);
+ extern void pgstat_reset_wait_event_storage(void);
++extern void pgstat_init_wait_event_usage(WaitEventUsage *usage,
++										 MemoryContext memcontext);
+ extern void pgstat_begin_wait_event_usage(WaitEventUsage *usage,
+ 										  MemoryContext memcontext);
+ extern void pgstat_end_wait_event_usage(WaitEventUsage *usage);
+ extern void pgstat_accumulate_wait_event_usage(WaitEventUsage *usage,
+ 											   const WaitEventUsageEntry *entries,
+ 											   int nentries);
++extern WaitEventUsage *pgstat_enter_wait_event_usage(WaitEventUsage *usage);
++extern void pgstat_restore_wait_event_usage(WaitEventUsage *usage);
+ extern void pgstat_count_wait_event_start(uint32 wait_event_info);
+ extern void pgstat_count_wait_event_end(void);
+ 
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index e3847e222be..c086fa48d80 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -101,12 +101,14 @@ select explain_filter('explain (buffers, format text) select * from int8_tbl i8'
+ 
+ -- WAITS option
+ select explain_filter('explain (analyze, waits, costs off, summary off, timing off, buffers off) select pg_sleep(0.01)');
+-            explain_filter             
+----------------------------------------
++             explain_filter              
++-----------------------------------------
+  Result (actual rows=N.N loops=N)
++   Wait Events:
++     Timeout:PgSleep calls=N time=N.N ms
+  Wait Events:
+    Timeout:PgSleep calls=N time=N.N ms
+-(3 rows)
++(5 rows)
+ 
+ select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Wait Events,0}';
+                                      ?column?                                     
+@@ -114,6 +116,12 @@ select explain_filter_to_json('explain (analyze, waits, costs off, summary off,
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+ (1 row)
+ 
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Plan,Wait Events,0}';
++                                     ?column?                                     
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
+ begin;
+ create function pg_temp.parallel_pg_sleep(float8) returns void
+   language internal volatile parallel safe as 'pg_sleep';
+@@ -130,6 +138,44 @@ select jsonb_path_query_first(
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+ (1 row)
+ 
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select pg_temp.parallel_pg_sleep(0.01)
++                         from tenk1 where unique1 = 1') #> '{0,Plan}',
++  '$.**."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
++                              jsonb_path_query_first                              
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
++rollback;
++begin;
++-- This test deliberately creates a Bitmap Index Scan runtime-key wait.
++-- The STABLE PL/pgSQL wrapper is test scaffolding: STABLE lets the
++-- expression be used as an index runtime key, while PL/pgSQL prevents SQL
++-- inlining from moving pg_sleep() out of the Bitmap Index Scan boundary.
++-- The planner GUCs below are likewise test-only scaffolding to make the
++-- node shape deterministic.
++create function pg_temp.explain_waits_sleep_int(int) returns int
++  language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
++create temp table explain_waits_bitmap (a int);
++insert into explain_waits_bitmap select g from generate_series(1, 10) g;
++create index explain_waits_bitmap_a_idx on explain_waits_bitmap(a);
++analyze explain_waits_bitmap;
++set local enable_seqscan = off;
++set local enable_indexscan = off;
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from explain_waits_bitmap
++                         where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
++  '$.** ? (@."Node Type" == "Bitmap Index Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
++                              jsonb_path_query_first                              
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
+ rollback;
+ explain (waits) select 1;
+ ERROR:  EXPLAIN option WAITS requires ANALYZE
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index 8821250bcef..bd196f248db 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -71,6 +71,7 @@ select explain_filter('explain (buffers, format text) select * from int8_tbl i8'
+ -- WAITS option
+ select explain_filter('explain (analyze, waits, costs off, summary off, timing off, buffers off) select pg_sleep(0.01)');
+ select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Wait Events,0}';
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Plan,Wait Events,0}';
+ begin;
+ create function pg_temp.parallel_pg_sleep(float8) returns void
+   language internal volatile parallel safe as 'pg_sleep';
+@@ -82,6 +83,34 @@ select jsonb_path_query_first(
+                          from tenk1 where unique1 = 1') #> '{0,Wait Events}',
+   '$[*] ? (@."Wait Event" == "PgSleep")'
+ );
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select pg_temp.parallel_pg_sleep(0.01)
++                         from tenk1 where unique1 = 1') #> '{0,Plan}',
++  '$.**."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
++rollback;
++begin;
++-- This test deliberately creates a Bitmap Index Scan runtime-key wait.
++-- The STABLE PL/pgSQL wrapper is test scaffolding: STABLE lets the
++-- expression be used as an index runtime key, while PL/pgSQL prevents SQL
++-- inlining from moving pg_sleep() out of the Bitmap Index Scan boundary.
++-- The planner GUCs below are likewise test-only scaffolding to make the
++-- node shape deterministic.
++create function pg_temp.explain_waits_sleep_int(int) returns int
++  language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
++create temp table explain_waits_bitmap (a int);
++insert into explain_waits_bitmap select g from generate_series(1, 10) g;
++create index explain_waits_bitmap_a_idx on explain_waits_bitmap(a);
++analyze explain_waits_bitmap;
++set local enable_seqscan = off;
++set local enable_indexscan = off;
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from explain_waits_bitmap
++                         where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
++  '$.** ? (@."Node Type" == "Bitmap Index Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
+ rollback;
+ explain (waits) select 1;
+ 
+-- 
+2.52.0
+

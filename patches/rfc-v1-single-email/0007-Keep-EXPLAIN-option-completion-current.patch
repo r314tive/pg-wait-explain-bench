@@ -1,0 +1,27 @@
+From 7fb9ef35e18a863870ac5c10c346dd739fe7050b Mon Sep 17 00:00:00 2001
+From: Ilmar Yunusov <tanswis42@gmail.com>
+Date: Sat, 9 May 2026 03:46:43 +0500
+Subject: [RFC PATCH v1 7/7] Keep EXPLAIN option completion current
+
+---
+ src/bin/psql/tab-complete.in.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/bin/psql/tab-complete.in.c b/src/bin/psql/tab-complete.in.c
+index b33490e7415..45712f4ac12 100644
+--- a/src/bin/psql/tab-complete.in.c
++++ b/src/bin/psql/tab-complete.in.c
+@@ -4525,8 +4525,8 @@ match_previous_words(int pattern_id,
+ 		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
+ 			COMPLETE_WITH("ANALYZE", "VERBOSE", "COSTS", "SETTINGS", "GENERIC_PLAN",
+ 						  "BUFFERS", "SERIALIZE", "WAL", "WAITS", "TIMING", "SUMMARY",
+-						  "MEMORY", "FORMAT");
+-		else if (TailMatches("ANALYZE|VERBOSE|COSTS|SETTINGS|GENERIC_PLAN|BUFFERS|WAL|WAITS|TIMING|SUMMARY|MEMORY"))
++						  "MEMORY", "IO", "FORMAT");
++		else if (TailMatches("ANALYZE|VERBOSE|COSTS|SETTINGS|GENERIC_PLAN|BUFFERS|WAL|WAITS|TIMING|SUMMARY|MEMORY|IO"))
+ 			COMPLETE_WITH("ON", "OFF");
+ 		else if (TailMatches("SERIALIZE"))
+ 			COMPLETE_WITH("TEXT", "NONE", "BINARY");
+-- 
+2.52.0
+

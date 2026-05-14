@@ -1,0 +1,81 @@
+This v1 resends the same patch content as v0, but changes the submission
+format: the patch series is attached to this single email, following
+PostgreSQL mailing list convention.
+
+No code changes from v0.
+
+This RFC prototype adds `EXPLAIN (ANALYZE, WAITS)`, which reports
+completed wait intervals observed through `pgstat_report_wait_start/end()`.
+The option is named `WAITS` in this RFC to match the short style of
+`BUFFERS`, `WAL`, `IO`, and `MEMORY`.  I am not attached to the exact name;
+`WAIT_EVENTS` may be clearer but is more verbose.
+
+PostgreSQL already exposes a backend's current wait event through
+pg_stat_activity.  This patch explores making the same wait event
+instrumentation useful in EXPLAIN ANALYZE by collecting per-statement and
+per-plan-node wait event usage while a statement executes.
+
+Statement-level output is reported as `Statement Wait Events`.  It counts
+each completed wait once per active statement-level collector and includes
+parallel worker waits.  Nested EXPLAIN ANALYZE WAITS collectors maintain
+separate statement-level summaries; a wait is counted once in each active
+collector.
+
+Plan-node output is reported as `Wait Events`.  Node-level attribution is
+intentionally inclusive, matching EXPLAIN ANALYZE node timing: a wait is
+attributed to every active plan node captured when the wait begins.  This
+means parent and child nodes can show the same wait, and node-level wait
+times must not be summed to compute a statement total.
+
+The implementation keeps wait-end accounting allocation-free.  Each
+statement and plan-node accumulator preallocates storage for 64 distinct
+wait event identities; additional distinct identities are accumulated in
+`Unrecorded Wait Event Calls` and `Unrecorded Wait Event Time` without event
+identity.  The fixed bound is intended to make the wait-end path predictable
+and safe in places where allocation would be undesirable.  The overflow
+bucket preserves total calls/time, but loses per-event identity.  This is a
+deliberate RFC point.
+
+Patch layout:
+
+1. add statement-level EXPLAIN WAITS reporting;
+2. aggregate statement-level waits from parallel workers;
+3. add plan-node wait attribution, including manual executor paths;
+4. refine attribution semantics, docs, overflow output, and tests;
+5. harden accumulator handling and keep wait-end allocation-free;
+6. hide accumulator internals behind the wait-event accounting API;
+7. update EXPLAIN option tab completion.
+
+Important review questions:
+
+- Is the `WAITS` option name and output shape acceptable, or should this be
+  `WAIT_EVENTS` / different labels?
+- Is inclusive per-node attribution the right semantic for EXPLAIN?
+- Is the fixed 64-entry accumulator plus explicit overflow bucket acceptable?
+- Is the disabled hot-path overhead of checking an exported boolean in
+  pgstat_report_wait_start/end acceptable?
+- Are the test scaffolding choices acceptable, especially planner GUCs and
+  pg_sleep wrappers used to force deterministic wait-attribution cases?  The
+  tests use pg_sleep only to force a stable Timeout:PgSleep wait identity;
+  durations are normalized by the existing EXPLAIN test filters.
+
+Local verification so far:
+
+- `make -s -j4`
+- `make -C doc/src/sgml check`
+- `make -s -C src/bin/psql`
+- `make -C src/test/regress check-tests TESTS='test_setup create_index explain'`
+- `git diff --check`
+
+The final diff of this 7-patch branch is identical to the development branch
+`r314tive/pg-wait-explain-mvp`.
+
+Local optimized macOS microbenchmarks are directional only.  The current
+synthetic C wait-loop run measured roughly 0.1-0.2 ns/wait disabled overhead
+and about 30 ns/wait enabled accounting for a single active node.  These
+numbers are not intended as performance evidence for commit; they only served
+as a local smoke check that the disabled path is plausibly small.  I would
+want repeated Linux, CPU-pinned numbers before drawing stronger conclusions.
+
+--
+Ilmar Yunusov
