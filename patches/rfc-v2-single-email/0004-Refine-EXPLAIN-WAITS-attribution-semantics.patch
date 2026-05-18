@@ -1,0 +1,1109 @@
+From 1ea51ee5f55dccad7f7692244640171f4e42fcbf Mon Sep 17 00:00:00 2001
+From: Ilmar Yunusov <tanswis42@gmail.com>
+Date: Sat, 9 May 2026 03:44:49 +0500
+Subject: [RFC PATCH v2 4/8] Refine EXPLAIN WAITS attribution semantics
+
+---
+ doc/src/sgml/ref/explain.sgml           |  52 ++++++-
+ src/backend/commands/explain.c          |  82 +++++++----
+ src/backend/executor/execParallel.c     | 121 +++++++++++-----
+ src/backend/utils/activity/wait_event.c | 184 +++++++++++++++++++-----
+ src/bin/psql/tab-complete.in.c          |   4 +-
+ src/include/utils/wait_event.h          |   5 +
+ src/test/regress/expected/explain.out   | 128 ++++++++++++++++-
+ src/test/regress/sql/explain.sql        | 102 ++++++++++++-
+ 8 files changed, 574 insertions(+), 104 deletions(-)
+
+diff --git a/doc/src/sgml/ref/explain.sgml b/doc/src/sgml/ref/explain.sgml
+index 5460568af1d..d699b215120 100644
+--- a/doc/src/sgml/ref/explain.sgml
++++ b/doc/src/sgml/ref/explain.sgml
+@@ -315,9 +315,46 @@ ROLLBACK;
+     <term><literal>WAITS</literal></term>
+     <listitem>
+      <para>
+-      Include exact backend-local wait event timing observed during query
+-      execution.  Wait events are grouped by wait event type and wait event
+-      name, and include the number of waits and total time spent waiting.
++      Include wait event timing observed during query execution.  Wait
++      events are grouped by wait event type and wait event name, using the
++      same wait event identifiers reported by
++      <structname>pg_stat_activity</structname>; see
++      <xref linkend="wait-event-table"/>.  Each entry includes the number
++      of completed waits and the total time spent waiting.  Wait timing is
++      collected when this option is enabled even if <literal>TIMING</literal>
++      is disabled.
++     </para>
++
++     <para>
++      If <command>EXPLAIN</command> cannot grow its per-query or per-node wait
++      event storage without risking an error while a wait is ending, waits
++      whose exact event identifier could not be stored are accumulated in an
++      <literal>Unrecorded Wait Event Calls</literal> counter and
++      <literal>Unrecorded Wait Event Time</literal> total.  This is a
++      reporting fallback under memory pressure, not a wait event emitted by
++      server instrumentation.
++     </para>
++
++     <para>
++      The top-level <literal>Statement Wait Events</literal> summary counts
++      each wait once for the statement, including waits reported by parallel
++      workers.  Nested <command>EXPLAIN (ANALYZE, WAITS)</command> commands
++      maintain separate statement-level summaries; a wait is counted once in
++      each active summary.  Plan nodes can also show <literal>Wait
++      Events</literal>.  Node-level wait events are inclusive, like plan node
++      timing in
++      <command>EXPLAIN ANALYZE</command>: a wait is attributed to every
++      active plan node when the wait begins.  Therefore node-level wait event
++      times should not be summed to compute the statement total.
++     </para>
++
++     <para>
++      The overhead of this option depends on the number of waits observed and,
++      for node-level output, on the number of active plan nodes when each wait
++      begins.
++     </para>
++
++     <para>
+       This parameter may only be used when <literal>ANALYZE</literal> is also
+       enabled.  It defaults to <literal>FALSE</literal>.
+      </para>
+@@ -405,6 +442,15 @@ ROLLBACK;
+    execution, and on machines that have relatively slow operating
+    system calls for obtaining the time of day.
+   </para>
++
++  <para>
++   The <literal>WAITS</literal> option also adds profiling overhead when
++   <literal>ANALYZE</literal> is used.  It measures wait intervals reported
++   by server instrumentation and maintains per-statement and per-node wait
++   event counters while the statement executes.  The overhead depends on the
++   number of reported waits, the number of distinct wait events, and the depth
++   of the active executor plan node stack.
++  </para>
+  </refsect1>
+ 
+  <refsect1>
+diff --git a/src/backend/commands/explain.c b/src/backend/commands/explain.c
+index 0575ae8368b..9c198f8e599 100644
+--- a/src/backend/commands/explain.c
++++ b/src/backend/commands/explain.c
+@@ -151,7 +151,7 @@ static bool peek_buffer_usage(ExplainState *es, const BufferUsage *usage);
+ static void show_buffer_usage(ExplainState *es, const BufferUsage *usage);
+ static void show_wal_usage(ExplainState *es, const WalUsage *usage);
+ static int	wait_event_usage_cmp(const void *a, const void *b);
+-static void show_wait_event_usage(ExplainState *es,
++static void show_wait_event_usage(ExplainState *es, const char *labelname,
+ 								  const WaitEventUsage *usage);
+ static void show_memory_counters(ExplainState *es,
+ 								 const MemoryContextCounters *mem_counters);
+@@ -219,7 +219,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
+ 		 * In the case of an INSTEAD NOTHING, tell at least that.  But in
+ 		 * non-text format, the output is delimited, so this isn't necessary.
+ 		 */
+-		if (es->format == EXPLAIN_FORMAT_TEXT)
++	if (es->format == EXPLAIN_FORMAT_TEXT)
+ 			appendStringInfoString(es->str, "Query rewrites to nothing\n");
+ 	}
+ 	else
+@@ -634,7 +634,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
+ 	ExplainPrintPlan(es, queryDesc);
+ 
+ 	if (waitEventUsagePtr)
+-		show_wait_event_usage(es, waitEventUsagePtr);
++		show_wait_event_usage(es, "Statement Wait Events", waitEventUsagePtr);
+ 
+ 	/* Show buffer and/or memory usage in planning */
+ 	if (peek_buffer_usage(es, bufusage) || mem_counters)
+@@ -2335,7 +2335,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
+ 	if (es->wal && planstate->instrument)
+ 		show_wal_usage(es, &planstate->instrument->instr.walusage);
+ 	if (es->waits)
+-		show_wait_event_usage(es, planstate->wait_event_usage);
++		show_wait_event_usage(es, "Wait Events", planstate->wait_event_usage);
+ 
+ 	/* Prepare per-worker buffer/WAL usage */
+ 	if (es->workers_state && (es->buffers || es->wal) && es->verbose)
+@@ -4556,14 +4556,15 @@ wait_event_usage_cmp(const void *a, const void *b)
+ }
+ 
+ static void
+-show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
++show_wait_event_usage(ExplainState *es, const char *labelname,
++					  const WaitEventUsage *usage)
+ {
+ 	WaitEventUsageEntry *entries;
+ 
+ 	if (usage == NULL)
+ 		return;
+ 
+-	if (usage->nentries == 0)
++	if (usage->nentries == 0 && usage->overflowed_calls == 0)
+ 		return;
+ 
+ 	if (usage->nentries > 0)
+@@ -4577,10 +4578,10 @@ show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
+ 	else
+ 		entries = NULL;
+ 
+-	if (es->format == EXPLAIN_FORMAT_TEXT)
++		if (es->format == EXPLAIN_FORMAT_TEXT)
+ 	{
+ 		ExplainIndentText(es);
+-		appendStringInfoString(es->str, "Wait Events:\n");
++		appendStringInfo(es->str, "%s:\n", labelname);
+ 		es->indent++;
+ 
+ 		for (int i = 0; i < usage->nentries; i++)
+@@ -4599,35 +4600,60 @@ show_wait_event_usage(ExplainState *es, const WaitEventUsage *usage)
+ 							 INSTR_TIME_GET_MILLISEC(entries[i].time));
+ 		}
+ 
++		if (usage->overflowed_calls > 0)
++		{
++			ExplainIndentText(es);
++			appendStringInfo(es->str,
++							 "Unrecorded Wait Event Calls: calls=%" PRIu64 " time=%0.3f ms\n",
++							 usage->overflowed_calls,
++							 INSTR_TIME_GET_MILLISEC(usage->overflowed_time));
++		}
++
+ 		es->indent--;
+ 	}
+ 	else
+ 	{
+-		ExplainOpenGroup("Wait-Events", "Wait Events", false, es);
+-
+-		for (int i = 0; i < usage->nentries; i++)
++		if (usage->nentries > 0)
+ 		{
+-			const char *event_type;
+-			const char *event_name;
++			ExplainOpenGroup("Wait-Events", labelname, false, es);
+ 
+-			event_type = pgstat_get_wait_event_type(entries[i].wait_event_info);
+-			event_name = pgstat_get_wait_event(entries[i].wait_event_info);
++			for (int i = 0; i < usage->nentries; i++)
++			{
++				const char *event_type;
++				const char *event_name;
+ 
+-			ExplainOpenGroup("Wait-Event", NULL, true, es);
+-			ExplainPropertyText("Wait Event Type",
+-								event_type ? event_type : "Unknown",
+-								es);
+-			ExplainPropertyText("Wait Event",
+-								event_name ? event_name : "unknown",
+-								es);
+-			ExplainPropertyUInteger("Calls", NULL, entries[i].calls, es);
+-			ExplainPropertyFloat("Time", "ms",
+-								 INSTR_TIME_GET_MILLISEC(entries[i].time),
+-								 3, es);
+-			ExplainCloseGroup("Wait-Event", NULL, true, es);
++				event_type = pgstat_get_wait_event_type(entries[i].wait_event_info);
++				event_name = pgstat_get_wait_event(entries[i].wait_event_info);
++
++				ExplainOpenGroup("Wait-Event", NULL, true, es);
++				ExplainPropertyText("Wait Event Type",
++									event_type ? event_type : "Unknown",
++									es);
++				ExplainPropertyText("Wait Event",
++									event_name ? event_name : "unknown",
++									es);
++				ExplainPropertyUInteger("Calls", NULL, entries[i].calls, es);
++				ExplainPropertyFloat("Time", "ms",
++									 INSTR_TIME_GET_MILLISEC(entries[i].time),
++									 3, es);
++				ExplainCloseGroup("Wait-Event", NULL, true, es);
++			}
++
++			ExplainCloseGroup("Wait-Events", labelname, false, es);
+ 		}
+ 
+-		ExplainCloseGroup("Wait-Events", "Wait Events", false, es);
++		if (usage->overflowed_calls > 0)
++		{
++			/*
++			 * This is not a wait event identity, so keep it outside the
++			 * Wait Events array in structured output.
++			 */
++			ExplainPropertyUInteger("Unrecorded Wait Event Calls", NULL,
++									usage->overflowed_calls, es);
++			ExplainPropertyFloat("Unrecorded Wait Event Time", "ms",
++								 INSTR_TIME_GET_MILLISEC(usage->overflowed_time),
++								 3, es);
++		}
+ 	}
+ 
+ 	if (entries)
+diff --git a/src/backend/executor/execParallel.c b/src/backend/executor/execParallel.c
+index f77f539dd27..520b4b8484f 100644
+--- a/src/backend/executor/execParallel.c
++++ b/src/backend/executor/execParallel.c
+@@ -87,6 +87,8 @@ typedef struct SharedWaitEventUsageWorker
+ {
+ 	int			nentries;
+ 	dsa_pointer entries;
++	uint64		overflowed_calls;
++	instr_time	overflowed_time;
+ } SharedWaitEventUsageWorker;
+ 
+ /*
+@@ -173,6 +175,10 @@ static bool ExecParallelReInitializeDSM(PlanState *planstate,
+ static bool ExecParallelRetrieveInstrumentation(PlanState *planstate,
+ 												ExecParallelRetrieveInstrumentationContext *r);
+ static void ExecParallelRetrieveWaitEventUsage(ParallelExecutorInfo *pei);
++static void ExecParallelInitWaitEventUsageWorker(SharedWaitEventUsageWorker *worker);
++static void ExecParallelAccumulateWaitEventUsageWorker(WaitEventUsage *usage,
++													   SharedWaitEventUsageWorker *worker,
++													   dsa_area *area);
+ static void ExecParallelReportWaitEventUsageWorker(SharedWaitEventUsageWorker *worker,
+ 												   dsa_area *area,
+ 												   const WaitEventUsage *usage);
+@@ -904,10 +910,7 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate,
+ 		wait_event_usage = shm_toc_allocate(pcxt->toc, wait_event_usage_len);
+ 		wait_event_usage->num_workers = nworkers;
+ 		for (int i = 0; i < nworkers; i++)
+-		{
+-			wait_event_usage->worker_usage[i].nentries = 0;
+-			wait_event_usage->worker_usage[i].entries = InvalidDsaPointer;
+-		}
++			ExecParallelInitWaitEventUsageWorker(&wait_event_usage->worker_usage[i]);
+ 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_WAIT_EVENT_USAGE,
+ 					   wait_event_usage);
+ 		pei->wait_event_usage = wait_event_usage;
+@@ -944,10 +947,7 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate,
+ 
+ 			worker_usage = GetInstrumentationWaitEventUsageArray(instrumentation);
+ 			for (i = 0; i < nworkers * e.nnodes; ++i)
+-			{
+-				worker_usage[i].nentries = 0;
+-				worker_usage[i].entries = InvalidDsaPointer;
+-			}
++				ExecParallelInitWaitEventUsageWorker(&worker_usage[i]);
+ 		}
+ 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_INSTRUMENTATION,
+ 					   instrumentation);
+@@ -1209,21 +1209,9 @@ ExecParallelRetrieveInstrumentation(PlanState *planstate,
+ 		wait_event_usage = GetInstrumentationWaitEventUsageArray(instrumentation);
+ 		wait_event_usage += i * instrumentation->num_workers;
+ 		for (n = 0; n < instrumentation->num_workers; ++n)
+-		{
+-			SharedWaitEventUsageWorker *worker = &wait_event_usage[n];
+-			WaitEventUsageEntry *entries;
+-
+-			if (worker->nentries <= 0 || !DsaPointerIsValid(worker->entries))
+-				continue;
+-
+-			entries = dsa_get_address(r->area, worker->entries);
+-			pgstat_accumulate_wait_event_usage(planstate->wait_event_usage,
+-											   entries,
+-											   worker->nentries);
+-			dsa_free(r->area, worker->entries);
+-			worker->nentries = 0;
+-			worker->entries = InvalidDsaPointer;
+-		}
++			ExecParallelAccumulateWaitEventUsageWorker(planstate->wait_event_usage,
++													   &wait_event_usage[n],
++													   r->area);
+ 	}
+ 
+ 	/*
+@@ -1339,18 +1327,46 @@ ExecParallelRetrieveWaitEventUsage(ParallelExecutorInfo *pei)
+ 		return;
+ 
+ 	for (int i = 0; i < shared->num_workers; i++)
++		ExecParallelAccumulateWaitEventUsageWorker(usage,
++												   &shared->worker_usage[i],
++												   pei->area);
++}
++
++static void
++ExecParallelInitWaitEventUsageWorker(SharedWaitEventUsageWorker *worker)
++{
++	worker->nentries = 0;
++	worker->entries = InvalidDsaPointer;
++	worker->overflowed_calls = 0;
++	INSTR_TIME_SET_ZERO(worker->overflowed_time);
++}
++
++static void
++ExecParallelAccumulateWaitEventUsageWorker(WaitEventUsage *usage,
++										   SharedWaitEventUsageWorker *worker,
++										   dsa_area *area)
++{
++	Assert(usage != NULL);
++	Assert(worker != NULL);
++	Assert(area != NULL);
++
++	if (worker->overflowed_calls > 0)
+ 	{
+-		SharedWaitEventUsageWorker *worker = &shared->worker_usage[i];
+-		WaitEventUsageEntry *entries;
++		usage->overflowed_calls += worker->overflowed_calls;
++		INSTR_TIME_ADD(usage->overflowed_time, worker->overflowed_time);
++		worker->overflowed_calls = 0;
++		INSTR_TIME_SET_ZERO(worker->overflowed_time);
++	}
+ 
+-		if (worker->nentries <= 0 || !DsaPointerIsValid(worker->entries))
+-			continue;
++	if (worker->nentries > 0 && DsaPointerIsValid(worker->entries))
++	{
++		WaitEventUsageEntry *entries;
+ 
+-		entries = dsa_get_address(pei->area, worker->entries);
++		entries = dsa_get_address(area, worker->entries);
+ 		pgstat_accumulate_wait_event_usage(usage,
+ 										   entries,
+ 										   worker->nentries);
+-		dsa_free(pei->area, worker->entries);
++		dsa_free(area, worker->entries);
+ 		worker->nentries = 0;
+ 		worker->entries = InvalidDsaPointer;
+ 	}
+@@ -1362,24 +1378,65 @@ ExecParallelReportWaitEventUsageWorker(SharedWaitEventUsageWorker *worker,
+ 									   const WaitEventUsage *usage)
+ {
+ 	WaitEventUsageEntry *entries;
++	WaitEventUsageEntry *old_entries = NULL;
+ 	dsa_pointer entries_dsa;
+ 	Size		entries_size;
++	int			old_nentries = 0;
++	int			new_nentries = 0;
++	int			i = 0;
++	int			j = 0;
+ 
+ 	Assert(worker != NULL);
+ 	Assert(area != NULL);
+ 	Assert(usage != NULL);
+ 
++	worker->overflowed_calls += usage->overflowed_calls;
++	INSTR_TIME_ADD(worker->overflowed_time, usage->overflowed_time);
++
+ 	if (usage->nentries <= 0)
+ 		return;
+ 
+-	entries_size = mul_size(sizeof(WaitEventUsageEntry), usage->nentries);
++	if (DsaPointerIsValid(worker->entries))
++	{
++		Assert(worker->nentries > 0);
++		old_nentries = worker->nentries;
++		old_entries = dsa_get_address(area, worker->entries);
++	}
++
++	entries_size = mul_size(sizeof(WaitEventUsageEntry),
++							(Size) old_nentries + (Size) usage->nentries);
+ 	entries_dsa = dsa_allocate(area, entries_size);
+ 	entries = dsa_get_address(area, entries_dsa);
+-	memcpy(entries, usage->entries, entries_size);
++
++	while (i < old_nentries && j < usage->nentries)
++	{
++		WaitEventUsageEntry *entry = &entries[new_nentries];
++		uint32		old_info = old_entries[i].wait_event_info;
++		uint32		new_info = usage->entries[j].wait_event_info;
++
++		if (old_info < new_info)
++			*entry = old_entries[i++];
++		else if (old_info > new_info)
++			*entry = usage->entries[j++];
++		else
++		{
++			*entry = old_entries[i++];
++			entry->calls += usage->entries[j].calls;
++			INSTR_TIME_ADD(entry->time, usage->entries[j].time);
++			j++;
++		}
++
++		new_nentries++;
++	}
++
++	while (i < old_nentries)
++		entries[new_nentries++] = old_entries[i++];
++	while (j < usage->nentries)
++		entries[new_nentries++] = usage->entries[j++];
+ 
+ 	if (DsaPointerIsValid(worker->entries))
+ 		dsa_free(area, worker->entries);
+-	worker->nentries = usage->nentries;
++	worker->nentries = new_nentries;
+ 	worker->entries = entries_dsa;
+ }
+ 
+diff --git a/src/backend/utils/activity/wait_event.c b/src/backend/utils/activity/wait_event.c
+index 3d5a10b44c4..61b418e8fd7 100644
+--- a/src/backend/utils/activity/wait_event.c
++++ b/src/backend/utils/activity/wait_event.c
+@@ -39,6 +39,10 @@ static const char *pgstat_get_wait_timeout(WaitEventTimeout w);
+ static const char *pgstat_get_wait_io(WaitEventIO w);
+ static void WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
+ 							  uint64 calls, const instr_time *elapsed);
++static void WaitEventUsageAddOverflow(WaitEventUsage *usage, uint64 calls,
++									  const instr_time *elapsed);
++static int	WaitEventUsageFind(const WaitEventUsage *usage,
++							   uint32 wait_event_info, bool *found);
+ 
+ 
+ static uint32 local_my_wait_event_info;
+@@ -48,7 +52,16 @@ uint32	   *my_wait_event_info = &local_my_wait_event_info;
+ 
+ int			pgstat_wait_event_usage_depth = 0;
+ static WaitEventUsage *pgstat_wait_event_usage = NULL;
++
++/*
++ * Top of the active executor node and query-level stacks.  Query-level wait
++ * accounting records each wait once in every active query-level collector.
++ * Per-node wait accounting records each wait in every active plan node,
++ * matching the inclusive timing semantics of EXPLAIN ANALYZE plan nodes.
++ */
+ static WaitEventUsage *pgstat_wait_event_node_usage = NULL;
++static WaitEventUsage *pgstat_wait_event_usage_node_stack = NULL;
++static WaitEventUsage *pgstat_wait_event_usage_query_stack = NULL;
+ static uint32 pgstat_wait_event_usage_current = 0;
+ static instr_time pgstat_wait_event_usage_start;
+ 
+@@ -387,24 +400,37 @@ pgstat_init_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+  *
+  * This is intended for short-lived instrumentation such as EXPLAIN ANALYZE.
+  * It records waits observed through pgstat_report_wait_start/end in backend
+- * local memory.  Nested collection is deliberately treated as part of the
+- * outer collection for now; callers that want independent nested accounting
+- * need a stack of WaitEventUsage contexts.
++ * local memory.  Nested top-level collectors are kept in a query-level stack;
++ * a wait is counted once in each active collector.
+  */
+ void
+ pgstat_begin_wait_event_usage(WaitEventUsage *usage, MemoryContext memcontext)
+ {
++	bool		first;
++
+ 	Assert(usage != NULL);
+ 	Assert(memcontext != NULL);
+ 
+-	if (pgstat_wait_event_usage_depth++ == 0)
++	first = pgstat_wait_event_usage_depth == 0;
++	if (first)
+ 	{
+-		pgstat_init_wait_event_usage(usage, memcontext);
+-		pgstat_wait_event_usage = usage;
+ 		pgstat_wait_event_node_usage = NULL;
++		pgstat_wait_event_usage_node_stack = NULL;
++		pgstat_wait_event_usage_query_stack = NULL;
+ 		pgstat_wait_event_usage_current = 0;
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
++
++	pgstat_init_wait_event_usage(usage, memcontext);
++	usage->query_parent = pgstat_wait_event_usage;
++	/*
++	 * A nested EXPLAIN can error out while one of its plan nodes is active,
++	 * skipping the usual node-level restore.  Remember the outer node stack so
++	 * ending this collector can discard any leaked inner node frames.
++	 */
++	usage->saved_node_usage = pgstat_wait_event_node_usage;
++	pgstat_wait_event_usage = usage;
++	pgstat_wait_event_usage_depth++;
+ }
+ 
+ /*
+@@ -415,14 +441,22 @@ pgstat_end_wait_event_usage(WaitEventUsage *usage)
+ {
+ 	Assert(usage != NULL);
+ 	Assert(pgstat_wait_event_usage_depth > 0);
++	Assert(pgstat_wait_event_usage == usage);
++
++	if (pgstat_wait_event_usage_current != 0)
++		pgstat_count_wait_event_end();
++
++	pgstat_wait_event_usage = usage->query_parent;
++	usage->query_parent = NULL;
++	pgstat_wait_event_node_usage = usage->saved_node_usage;
++	usage->saved_node_usage = NULL;
+ 
+ 	if (--pgstat_wait_event_usage_depth == 0)
+ 	{
+-		if (pgstat_wait_event_usage_current != 0)
+-			pgstat_count_wait_event_end();
+-
+ 		pgstat_wait_event_usage = NULL;
+ 		pgstat_wait_event_node_usage = NULL;
++		pgstat_wait_event_usage_node_stack = NULL;
++		pgstat_wait_event_usage_query_stack = NULL;
+ 		pgstat_wait_event_usage_current = 0;
+ 		INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ 	}
+@@ -433,6 +467,9 @@ pgstat_enter_wait_event_usage(WaitEventUsage *usage)
+ {
+ 	WaitEventUsage *previous = pgstat_wait_event_node_usage;
+ 
++	Assert(usage != NULL);
++
++	usage->active_parent = previous;
+ 	pgstat_wait_event_node_usage = usage;
+ 	return previous;
+ }
+@@ -440,6 +477,9 @@ pgstat_enter_wait_event_usage(WaitEventUsage *usage)
+ void
+ pgstat_restore_wait_event_usage(WaitEventUsage *usage)
+ {
++	Assert(pgstat_wait_event_node_usage == NULL ||
++		   pgstat_wait_event_node_usage->active_parent == usage);
++
+ 	pgstat_wait_event_node_usage = usage;
+ }
+ 
+@@ -460,6 +500,8 @@ pgstat_count_wait_event_start(uint32 wait_event_info)
+ 		pgstat_count_wait_event_end();
+ 
+ 	pgstat_wait_event_usage_current = wait_event_info;
++	pgstat_wait_event_usage_node_stack = pgstat_wait_event_node_usage;
++	pgstat_wait_event_usage_query_stack = pgstat_wait_event_usage;
+ 	INSTR_TIME_SET_CURRENT(pgstat_wait_event_usage_start);
+ }
+ 
+@@ -480,17 +522,24 @@ pgstat_count_wait_event_end(void)
+ 	elapsed = end;
+ 	INSTR_TIME_SUBTRACT(elapsed, pgstat_wait_event_usage_start);
+ 
+-	WaitEventUsageAdd(pgstat_wait_event_usage,
+-					  pgstat_wait_event_usage_current,
+-					  1,
+-					  &elapsed);
+-	if (pgstat_wait_event_node_usage != NULL)
+-		WaitEventUsageAdd(pgstat_wait_event_node_usage,
++	for (WaitEventUsage *query_usage = pgstat_wait_event_usage_query_stack;
++		 query_usage != NULL;
++		 query_usage = query_usage->query_parent)
++		WaitEventUsageAdd(query_usage,
++						  pgstat_wait_event_usage_current,
++						  1,
++						  &elapsed);
++	for (WaitEventUsage *node_usage = pgstat_wait_event_usage_node_stack;
++		 node_usage != NULL;
++		 node_usage = node_usage->active_parent)
++		WaitEventUsageAdd(node_usage,
+ 						  pgstat_wait_event_usage_current,
+ 						  1,
+ 						  &elapsed);
+ 
+ 	pgstat_wait_event_usage_current = 0;
++	pgstat_wait_event_usage_node_stack = NULL;
++	pgstat_wait_event_usage_query_stack = NULL;
+ 	INSTR_TIME_SET_ZERO(pgstat_wait_event_usage_start);
+ }
+ 
+@@ -509,56 +558,123 @@ pgstat_accumulate_wait_event_usage(WaitEventUsage *usage,
+ 						  &entries[i].time);
+ }
+ 
++/*
++ * Find the existing entry, or the insertion position for a new entry.
++ *
++ * WaitEventUsage entries are kept sorted by wait_event_info so the hot
++ * wait-end path does not need a linear scan through all distinct wait events
++ * already seen by the query or plan node.
++ */
++static int
++WaitEventUsageFind(const WaitEventUsage *usage, uint32 wait_event_info,
++				   bool *found)
++{
++	int			low = 0;
++	int			high = usage->nentries;
++
++	while (low < high)
++	{
++		int			mid = low + (high - low) / 2;
++		uint32		entry_info = usage->entries[mid].wait_event_info;
++
++		if (entry_info < wait_event_info)
++			low = mid + 1;
++		else
++			high = mid;
++	}
++
++	*found = low < usage->nentries &&
++		usage->entries[low].wait_event_info == wait_event_info;
++	return low;
++}
++
+ static void
+ WaitEventUsageAdd(WaitEventUsage *usage, uint32 wait_event_info,
+ 				  uint64 calls, const instr_time *elapsed)
+ {
+-	WaitEventUsageEntry *entry = NULL;
++	bool		found;
++	int			idx;
++	WaitEventUsageEntry *entry;
+ 
+-	for (int i = 0; i < usage->nentries; i++)
+-	{
+-		if (usage->entries[i].wait_event_info == wait_event_info)
+-		{
+-			entry = &usage->entries[i];
+-			break;
+-		}
+-	}
++	idx = WaitEventUsageFind(usage, wait_event_info, &found);
+ 
+-	if (entry == NULL)
++	if (!found)
+ 	{
+ 		if (usage->nentries >= usage->maxentries)
+ 		{
+-			MemoryContext oldcontext;
+ 			int			newmaxentries;
++			Size		entries_size;
++			WaitEventUsageEntry *newentries;
+ 
+ 			if (usage->maxentries > 0)
++			{
++				if ((Size) usage->maxentries >
++					MaxAllocSize / sizeof(WaitEventUsageEntry) / 2)
++				{
++					WaitEventUsageAddOverflow(usage, calls, elapsed);
++					return;
++				}
++
+ 				newmaxentries = usage->maxentries * 2;
++			}
+ 			else
+ 				newmaxentries = WAIT_EVENT_USAGE_INITIAL_EVENTS;
+ 
+-			oldcontext = MemoryContextSwitchTo(usage->memcontext);
++			if ((Size) newmaxentries >
++				MaxAllocSize / sizeof(WaitEventUsageEntry))
++			{
++				WaitEventUsageAddOverflow(usage, calls, elapsed);
++				return;
++			}
++
++			entries_size = sizeof(WaitEventUsageEntry) * newmaxentries;
++			/*
++			 * Wait completion can happen in a critical section, so growth
++			 * must not throw ERROR.  If storage cannot be grown without
++			 * throwing, preserve total wait time in the overflow bucket.
++			 */
+ 			if (usage->entries)
+-				usage->entries = repalloc_array(usage->entries,
+-												WaitEventUsageEntry,
+-												newmaxentries);
++				newentries = repalloc_extended(usage->entries, entries_size,
++											   MCXT_ALLOC_NO_OOM);
+ 			else
+-				usage->entries = palloc_array(WaitEventUsageEntry,
+-											  newmaxentries);
+-			MemoryContextSwitchTo(oldcontext);
++				newentries = MemoryContextAllocExtended(usage->memcontext,
++														entries_size,
++														MCXT_ALLOC_NO_OOM);
++			if (newentries == NULL)
++			{
++				WaitEventUsageAddOverflow(usage, calls, elapsed);
++				return;
++			}
+ 
++			usage->entries = newentries;
+ 			usage->maxentries = newmaxentries;
+ 		}
+ 
+-		entry = &usage->entries[usage->nentries++];
++		if (idx < usage->nentries)
++			memmove(&usage->entries[idx + 1], &usage->entries[idx],
++					sizeof(WaitEventUsageEntry) * (usage->nentries - idx));
++
++		entry = &usage->entries[idx];
++		usage->nentries++;
+ 		entry->wait_event_info = wait_event_info;
+ 		entry->calls = 0;
+ 		INSTR_TIME_SET_ZERO(entry->time);
+ 	}
++	else
++		entry = &usage->entries[idx];
+ 
+ 	entry->calls += calls;
+ 	INSTR_TIME_ADD(entry->time, *elapsed);
+ }
+ 
++static void
++WaitEventUsageAddOverflow(WaitEventUsage *usage, uint64 calls,
++						  const instr_time *elapsed)
++{
++	usage->overflowed_calls += calls;
++	INSTR_TIME_ADD(usage->overflowed_time, *elapsed);
++}
++
+ /* ----------
+  * pgstat_get_wait_event_type() -
+  *
+diff --git a/src/bin/psql/tab-complete.in.c b/src/bin/psql/tab-complete.in.c
+index db65d130fcb..b33490e7415 100644
+--- a/src/bin/psql/tab-complete.in.c
++++ b/src/bin/psql/tab-complete.in.c
+@@ -4524,9 +4524,9 @@ match_previous_words(int pattern_id,
+ 		 */
+ 		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
+ 			COMPLETE_WITH("ANALYZE", "VERBOSE", "COSTS", "SETTINGS", "GENERIC_PLAN",
+-						  "BUFFERS", "SERIALIZE", "WAL", "TIMING", "SUMMARY",
++						  "BUFFERS", "SERIALIZE", "WAL", "WAITS", "TIMING", "SUMMARY",
+ 						  "MEMORY", "FORMAT");
+-		else if (TailMatches("ANALYZE|VERBOSE|COSTS|SETTINGS|GENERIC_PLAN|BUFFERS|WAL|TIMING|SUMMARY|MEMORY"))
++		else if (TailMatches("ANALYZE|VERBOSE|COSTS|SETTINGS|GENERIC_PLAN|BUFFERS|WAL|WAITS|TIMING|SUMMARY|MEMORY"))
+ 			COMPLETE_WITH("ON", "OFF");
+ 		else if (TailMatches("SERIALIZE"))
+ 			COMPLETE_WITH("TEXT", "NONE", "BINARY");
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 64411288403..f14945cdb16 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -25,9 +25,14 @@ typedef struct WaitEventUsageEntry
+ typedef struct WaitEventUsage
+ {
+ 	MemoryContext memcontext;
++	struct WaitEventUsage *active_parent; /* active plan-node stack link */
++	struct WaitEventUsage *query_parent;	/* active query-level stack link */
++	struct WaitEventUsage *saved_node_usage;	/* node stack at query start */
+ 	int			nentries;
+ 	int			maxentries;
+ 	WaitEventUsageEntry *entries;
++	uint64		overflowed_calls;
++	instr_time	overflowed_time;
+ } WaitEventUsage;
+ 
+ extern const char *pgstat_get_wait_event(uint32 wait_event_info);
+diff --git a/src/test/regress/expected/explain.out b/src/test/regress/expected/explain.out
+index c086fa48d80..275292d6172 100644
+--- a/src/test/regress/expected/explain.out
++++ b/src/test/regress/expected/explain.out
+@@ -47,6 +47,21 @@ begin
+     return data::jsonb;
+ end;
+ $$;
++-- For tests that assert numeric EXPLAIN fields, preserve unfiltered JSON.
++create function explain_to_json(text) returns jsonb
++language plpgsql as
++$$
++declare
++    data text := '';
++    ln text;
++begin
++    for ln in execute $1
++    loop
++        data := data || ln;
++    end loop;
++    return data::jsonb;
++end;
++$$;
+ -- Disable JIT, or we'll get different output on machines where that's been
+ -- forced on
+ set jit = off;
+@@ -106,11 +121,11 @@ select explain_filter('explain (analyze, waits, costs off, summary off, timing o
+  Result (actual rows=N.N loops=N)
+    Wait Events:
+      Timeout:PgSleep calls=N time=N.N ms
+- Wait Events:
++ Statement Wait Events:
+    Timeout:PgSleep calls=N time=N.N ms
+ (5 rows)
+ 
+-select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Wait Events,0}';
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Statement Wait Events,0}';
+                                      ?column?                                     
+ ----------------------------------------------------------------------------------
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+@@ -122,6 +137,52 @@ select explain_filter_to_json('explain (analyze, waits, costs off, summary off,
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+ (1 row)
+ 
++begin;
++create function pg_temp.nested_explain_waits() returns void
++  language plpgsql as
++$$
++begin
++  perform explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)');
++end;
++$$;
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Statement Wait Events,0}';
++                                     ?column?                                     
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Plan,Wait Events,0}';
++                                     ?column?                                     
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
++rollback;
++begin;
++-- If a nested EXPLAIN errors while one of its plan nodes is active, ending
++-- that collector must restore the outer node wait-attribution stack.  The
++-- volatile division-by-zero helper keeps the error at execution time.
++create function pg_temp.explain_waits_divzero() returns int
++  language plpgsql volatile as $$begin return 1 / 0; end$$;
++create function pg_temp.nested_explain_waits_error() returns void
++  language plpgsql as
++$$
++begin
++  begin
++    perform explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.explain_waits_divzero()');
++  exception when division_by_zero then
++    null;
++  end;
++  perform pg_sleep(0.01);
++end;
++$$;
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits_error()') #> '{0,Plan,Wait Events,0}';
++                                     ?column?                                     
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
++rollback;
+ begin;
+ create function pg_temp.parallel_pg_sleep(float8) returns void
+   language internal volatile parallel safe as 'pg_sleep';
+@@ -130,7 +191,7 @@ set local max_parallel_workers_per_gather = 1;
+ select jsonb_path_query_first(
+   explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
+                          select pg_temp.parallel_pg_sleep(0.01)
+-                         from tenk1 where unique1 = 1') #> '{0,Wait Events}',
++                         from tenk1 where unique1 = 1') #> '{0,Statement Wait Events}',
+   '$[*] ? (@."Wait Event" == "PgSleep")'
+ );
+                               jsonb_path_query_first                              
+@@ -149,6 +210,53 @@ select jsonb_path_query_first(
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+ (1 row)
+ 
++rollback;
++begin;
++-- This test deliberately creates a rescanned parallel-aware Index Scan.
++-- The planner GUCs and tenk1 parallel_workers reloption are test-only
++-- scaffolding to make the parallel rescanned node shape deterministic.  The
++-- STABLE PARALLEL SAFE wrapper around pg_sleep() creates a runtime key wait
++-- under the parallel-aware Index Scan.  The invariant checked below is that
++-- PgSleep calls accumulated for that node cover all reported scan loops; this
++-- fails if per-node worker wait usage is replaced on relaunch instead of
++-- merged across worker reports.
++create function pg_temp.explain_waits_parallel_sleep_int(int) returns int
++  language plpgsql stable parallel safe as $$begin perform pg_sleep(0.001); return $1; end$$;
++alter table tenk1 set (parallel_workers = 4);
++set local parallel_setup_cost = 0;
++set local parallel_tuple_cost = 0;
++set local max_parallel_workers_per_gather = 4;
++set local parallel_leader_participation = off;
++set local min_parallel_index_scan_size = 0;
++set local enable_seqscan = off;
++set local enable_bitmapscan = off;
++set local enable_material = off;
++set local random_page_cost = 2;
++with plan_json as (
++  select explain_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from
++                           (select count(unique1) from tenk1
++                            where hundred > pg_temp.explain_waits_parallel_sleep_int(10)) ss
++                           right join (values (1),(2),(3)) v(x) on true') #> '{0,Plan}' as plan
++),
++parallel_scan as (
++  select jsonb_path_query_first(plan,
++                                '$.** ? (@."Node Type" == "Index Scan" && @."Parallel Aware" == true)') as node
++  from plan_json
++),
++pgsleep_wait as (
++  select node,
++         jsonb_path_query_first(node,
++                                '$."Wait Events"[*] ? (@."Wait Event" == "PgSleep")') as wait
++  from parallel_scan
++)
++select (wait->>'Calls')::numeric >= (node->>'Actual Loops')::numeric as "parallel rescan waits accumulated"
++from pgsleep_wait;
++ parallel rescan waits accumulated 
++-----------------------------------
++ t
++(1 row)
++
+ rollback;
+ begin;
+ -- This test deliberately creates a Bitmap Index Scan runtime-key wait.
+@@ -157,6 +265,9 @@ begin;
+ -- inlining from moving pg_sleep() out of the Bitmap Index Scan boundary.
+ -- The planner GUCs below are likewise test-only scaffolding to make the
+ -- node shape deterministic.
++-- The two JSONPath checks verify inclusive per-node attribution: the same
++-- runtime-key wait appears on the Bitmap Index Scan and its Bitmap Heap Scan
++-- parent, while query-level wait accounting still counts the wait once.
+ create function pg_temp.explain_waits_sleep_int(int) returns int
+   language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
+ create temp table explain_waits_bitmap (a int);
+@@ -176,6 +287,17 @@ select jsonb_path_query_first(
+  {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
+ (1 row)
+ 
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from explain_waits_bitmap
++                         where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
++  '$.** ? (@."Node Type" == "Bitmap Heap Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
++                              jsonb_path_query_first                              
++----------------------------------------------------------------------------------
++ {"Time": 0.0, "Calls": 0, "Wait Event": "PgSleep", "Wait Event Type": "Timeout"}
++(1 row)
++
+ rollback;
+ explain (waits) select 1;
+ ERROR:  EXPLAIN option WAITS requires ANALYZE
+diff --git a/src/test/regress/sql/explain.sql b/src/test/regress/sql/explain.sql
+index bd196f248db..9f50ef189b0 100644
+--- a/src/test/regress/sql/explain.sql
++++ b/src/test/regress/sql/explain.sql
+@@ -51,6 +51,22 @@ begin
+ end;
+ $$;
+ 
++-- For tests that assert numeric EXPLAIN fields, preserve unfiltered JSON.
++create function explain_to_json(text) returns jsonb
++language plpgsql as
++$$
++declare
++    data text := '';
++    ln text;
++begin
++    for ln in execute $1
++    loop
++        data := data || ln;
++    end loop;
++    return data::jsonb;
++end;
++$$;
++
+ -- Disable JIT, or we'll get different output on machines where that's been
+ -- forced on
+ set jit = off;
+@@ -70,9 +86,40 @@ select explain_filter('explain (buffers, format text) select * from int8_tbl i8'
+ 
+ -- WAITS option
+ select explain_filter('explain (analyze, waits, costs off, summary off, timing off, buffers off) select pg_sleep(0.01)');
+-select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Wait Events,0}';
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Statement Wait Events,0}';
+ select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)') #> '{0,Plan,Wait Events,0}';
+ begin;
++create function pg_temp.nested_explain_waits() returns void
++  language plpgsql as
++$$
++begin
++  perform explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_sleep(0.01)');
++end;
++$$;
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Statement Wait Events,0}';
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits()') #> '{0,Plan,Wait Events,0}';
++rollback;
++begin;
++-- If a nested EXPLAIN errors while one of its plan nodes is active, ending
++-- that collector must restore the outer node wait-attribution stack.  The
++-- volatile division-by-zero helper keeps the error at execution time.
++create function pg_temp.explain_waits_divzero() returns int
++  language plpgsql volatile as $$begin return 1 / 0; end$$;
++create function pg_temp.nested_explain_waits_error() returns void
++  language plpgsql as
++$$
++begin
++  begin
++    perform explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.explain_waits_divzero()');
++  exception when division_by_zero then
++    null;
++  end;
++  perform pg_sleep(0.01);
++end;
++$$;
++select explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json) select pg_temp.nested_explain_waits_error()') #> '{0,Plan,Wait Events,0}';
++rollback;
++begin;
+ create function pg_temp.parallel_pg_sleep(float8) returns void
+   language internal volatile parallel safe as 'pg_sleep';
+ set local debug_parallel_query = on;
+@@ -80,7 +127,7 @@ set local max_parallel_workers_per_gather = 1;
+ select jsonb_path_query_first(
+   explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
+                          select pg_temp.parallel_pg_sleep(0.01)
+-                         from tenk1 where unique1 = 1') #> '{0,Wait Events}',
++                         from tenk1 where unique1 = 1') #> '{0,Statement Wait Events}',
+   '$[*] ? (@."Wait Event" == "PgSleep")'
+ );
+ select jsonb_path_query_first(
+@@ -91,12 +138,57 @@ select jsonb_path_query_first(
+ );
+ rollback;
+ begin;
++-- This test deliberately creates a rescanned parallel-aware Index Scan.
++-- The planner GUCs and tenk1 parallel_workers reloption are test-only
++-- scaffolding to make the parallel rescanned node shape deterministic.  The
++-- STABLE PARALLEL SAFE wrapper around pg_sleep() creates a runtime key wait
++-- under the parallel-aware Index Scan.  The invariant checked below is that
++-- PgSleep calls accumulated for that node cover all reported scan loops; this
++-- fails if per-node worker wait usage is replaced on relaunch instead of
++-- merged across worker reports.
++create function pg_temp.explain_waits_parallel_sleep_int(int) returns int
++  language plpgsql stable parallel safe as $$begin perform pg_sleep(0.001); return $1; end$$;
++alter table tenk1 set (parallel_workers = 4);
++set local parallel_setup_cost = 0;
++set local parallel_tuple_cost = 0;
++set local max_parallel_workers_per_gather = 4;
++set local parallel_leader_participation = off;
++set local min_parallel_index_scan_size = 0;
++set local enable_seqscan = off;
++set local enable_bitmapscan = off;
++set local enable_material = off;
++set local random_page_cost = 2;
++with plan_json as (
++  select explain_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from
++                           (select count(unique1) from tenk1
++                            where hundred > pg_temp.explain_waits_parallel_sleep_int(10)) ss
++                           right join (values (1),(2),(3)) v(x) on true') #> '{0,Plan}' as plan
++),
++parallel_scan as (
++  select jsonb_path_query_first(plan,
++                                '$.** ? (@."Node Type" == "Index Scan" && @."Parallel Aware" == true)') as node
++  from plan_json
++),
++pgsleep_wait as (
++  select node,
++         jsonb_path_query_first(node,
++                                '$."Wait Events"[*] ? (@."Wait Event" == "PgSleep")') as wait
++  from parallel_scan
++)
++select (wait->>'Calls')::numeric >= (node->>'Actual Loops')::numeric as "parallel rescan waits accumulated"
++from pgsleep_wait;
++rollback;
++begin;
+ -- This test deliberately creates a Bitmap Index Scan runtime-key wait.
+ -- The STABLE PL/pgSQL wrapper is test scaffolding: STABLE lets the
+ -- expression be used as an index runtime key, while PL/pgSQL prevents SQL
+ -- inlining from moving pg_sleep() out of the Bitmap Index Scan boundary.
+ -- The planner GUCs below are likewise test-only scaffolding to make the
+ -- node shape deterministic.
++-- The two JSONPath checks verify inclusive per-node attribution: the same
++-- runtime-key wait appears on the Bitmap Index Scan and its Bitmap Heap Scan
++-- parent, while query-level wait accounting still counts the wait once.
+ create function pg_temp.explain_waits_sleep_int(int) returns int
+   language plpgsql stable as $$begin perform pg_sleep(0.01); return $1; end$$;
+ create temp table explain_waits_bitmap (a int);
+@@ -111,6 +203,12 @@ select jsonb_path_query_first(
+                          where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
+   '$.** ? (@."Node Type" == "Bitmap Index Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
+ );
++select jsonb_path_query_first(
++  explain_filter_to_json('explain (analyze, waits, costs off, summary off, timing off, buffers off, format json)
++                         select * from explain_waits_bitmap
++                         where a = pg_temp.explain_waits_sleep_int(1)') #> '{0,Plan}',
++  '$.** ? (@."Node Type" == "Bitmap Heap Scan")."Wait Events"[*] ? (@."Wait Event" == "PgSleep")'
++);
+ rollback;
+ explain (waits) select 1;
+ 
+-- 
+2.52.0
+

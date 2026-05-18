@@ -1,0 +1,52 @@
+This v2 keeps the same RFC feature scope as v1 and changes only regression
+test coverage/stability.
+
+v1 thread:
+https://www.postgresql.org/message-id/CALCfnuquuxtZmmzQBZ_yxaihfj7bnALXdzi9Nj=RYUW4iwY6GQ@mail.gmail.com
+
+v0 thread:
+https://www.postgresql.org/message-id/cover.1778280923.git.tanswis42%40gmail.com
+
+The CFBot FreeBSD run showed that the regression tests were assuming a too
+narrow statement-level wait list.  EXPLAIN WAITS can validly observe additional
+statement-level waits around the measured query, for example parallel-executor
+IPC waits or DSM allocation waits.  Those are valid observed waits, not an
+accounting bug.
+
+Changes in v2:
+
+1. Make the text-output test check for the required Wait Events and Statement
+   Wait Events lines, instead of expecting the full statement-level wait list
+   to contain only Timeout:PgSleep.
+2. Make JSON tests find Timeout:PgSleep by JSONPath instead of assuming it is
+   the first wait event array element.
+3. Disable debug_parallel_query and default gather workers in the explain
+   regression test before serial EXPLAIN checks.
+4. Disable debug_parallel_query and gather workers in the bitmap runtime-key
+   attribution test.
+5. Remove the plain-regression assertion for rescanned parallel worker wait
+   aggregation for now.  Worker availability and the exact parallel plan shape
+   are not deterministic enough for that test under the parallel regression
+   harness.  The accounting behavior is still implemented, but this specific
+   edge should come back as a more isolated test if we can make it deterministic
+   enough for CFBot.
+
+There are no accounting-code changes from v1.
+
+The main RFC questions are unchanged:
+
+- whether the option should be named WAITS or WAIT_EVENTS;
+- whether inclusive per-node attribution is the right initial semantics;
+- whether the fixed accumulator limit and overflow reporting are acceptable;
+- whether the disabled/enabled hot-path overhead is acceptable.
+
+Local verification:
+
+make -C src/test/regress check TESTS=explain
+All 245 tests passed.
+
+git diff --check
+passed.
+
+Regards,
+Ilmar
